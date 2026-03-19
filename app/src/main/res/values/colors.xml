@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="navy_deep">#0A1628</color>
+    <color name="navy_mid">#0D2240</color>
+    <color name="navy_light">#1A3A5C</color>
+    <color name="teal_accent">#00BCD4</color>
+    <color name="teal_light">#4DD0E1</color>
+    <color name="amber_warn">#FFC107</color>
+    <color name="red_alarm">#F44336</color>
+    <color name="green_go">#4CAF50</color>
+    <color name="surface_card">#112233</color>
+    <color name="on_surface">#CFDEEF</color>
+    <color name="muted">#6B8EAE</color>
+</resources>

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">AutoPilot BLE</string>
+    <string name="scan_title">Scan for Devices</string>
+    <string name="dashboard_title">Dashboard</string>
+    <string name="settings_title">Settings</string>
+    <string name="engage">Engage</string>
+    <string name="standby">Standby</string>
+    <string name="connect">Connect</string>
+    <string name="disconnect">Disconnect</string>
+    <string name="permission_required">Bluetooth permission required</string>
+</resources>
