@@ -2,11 +2,11 @@ package com.mikewen.autopilot.ui.screens
 
 import android.Manifest
 import android.os.Build
+import androidx.activity.compose.BackHandler
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -29,9 +29,13 @@ fun ScanScreen(
     onConnected: () -> Unit,
     onBack: () -> Unit
 ) {
-    val connectionState by vm.connectionState.collectAsState()
-    val devices         by vm.scannedDevices.collectAsState()
-    val selectedType    by vm.selectedType.collectAsState()
+    val connectionState    by vm.connectionState.collectAsState()
+    val devices            by vm.scannedDevices.collectAsState()
+    val selectedType       by vm.selectedType.collectAsState()
+    val imuConnectionState by vm.imuConnectionState.collectAsState()
+    val imuDevices         by vm.scannedImuDevices.collectAsState()
+
+    BackHandler { onBack() }
 
     LaunchedEffect(connectionState) {
         if (connectionState is BleConnectionState.Connected) onConnected()
@@ -49,6 +53,7 @@ fun ScanScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(NavyDeep)
+            .statusBarsPadding()
             .padding(16.dp)
     ) {
         // Top bar
@@ -57,7 +62,7 @@ fun ScanScreen(
                 Icon(Icons.Default.ArrowBack, "Back", tint = TealAccent)
             }
             Column(modifier = Modifier.weight(1f)) {
-                Text("SCAN DEVICES", style = MaterialTheme.typography.titleLarge, color = Color.White)
+                Text("CONNECT DEVICES", style = MaterialTheme.typography.titleLarge, color = Color.White)
                 selectedType?.let {
                     Text(it.displayName.uppercase(), style = MaterialTheme.typography.labelMedium, color = TealAccent)
                 }
@@ -69,36 +74,112 @@ fun ScanScreen(
         if (!blePermissions.allPermissionsGranted) {
             PermissionCard { blePermissions.launchMultiplePermissionRequest() }
         } else {
-            ScanButton(connectionState, onScan = vm::startScan, onStop = vm::stopScan)
-            Spacer(Modifier.height(10.dp))
-            StatusChip(connectionState)
-            Spacer(Modifier.height(14.dp))
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(16.dp)
+            ) {
 
-            if (devices.isEmpty() && connectionState is BleConnectionState.Scanning) {
-                Box(Modifier.fillMaxWidth().padding(32.dp), Alignment.Center) {
-                    Text("Searching for autopilots…", style = MaterialTheme.typography.bodyMedium, color = Muted)
-                }
-            }
+                // ── Section 1: Autopilot ──────────────────────────────────────
+                SectionHeader("⚓  AUTOPILOT", "BLE_tiller  •  ESC_PWM  •  BLDC_PWM")
 
-            LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(devices, key = { it.address }) { device ->
-                    DeviceCard(device) { vm.connect(device) }
+                ScanButton(
+                    scanning = connectionState is BleConnectionState.Scanning,
+                    label    = "SCAN FOR AUTOPILOT",
+                    onScan   = vm::startScan,
+                    onStop   = vm::stopScan
+                )
+
+                val apText = when (connectionState) {
+                    is BleConnectionState.Scanning    -> "Scanning…"
+                    is BleConnectionState.Connecting  -> "Connecting to ${(connectionState as BleConnectionState.Connecting).deviceName}…"
+                    is BleConnectionState.Connected   -> "✓ Connected — ${(connectionState as BleConnectionState.Connected).deviceName}  ${(connectionState as BleConnectionState.Connected).rssi} dBm"
+                    is BleConnectionState.Error       -> (connectionState as BleConnectionState.Error).message
+                    is BleConnectionState.Disconnected -> "Ready"
                 }
+                val apColor = when (connectionState) {
+                    is BleConnectionState.Connected    -> GreenGo
+                    is BleConnectionState.Connecting,
+                    is BleConnectionState.Scanning     -> TealAccent
+                    is BleConnectionState.Error        -> RedAlarm
+                    else                               -> Muted
+                }
+                Text(apText, style = MaterialTheme.typography.bodyMedium, color = apColor)
+
+                if (devices.isEmpty() && connectionState is BleConnectionState.Scanning) {
+                    SearchingHint("Searching for autopilots…")
+                }
+                devices.forEach { device ->
+                    AutopilotDeviceCard(device) { vm.connect(device) }
+                }
+
+                HorizontalDivider(color = NavyLight, thickness = 1.dp)
+
+                // ── Section 2: IMU Sensor ─────────────────────────────────────
+                SectionHeader("🧭  IMU SENSOR", "IMU_PWM  •  IMU_*  (optional — both autopilot types)")
+
+                ScanButton(
+                    scanning = imuConnectionState is ImuConnectionState.Scanning,
+                    label    = "SCAN FOR IMU",
+                    onScan   = vm::startImuScan,
+                    onStop   = vm::stopImuScan
+                )
+
+                val imuText = when (imuConnectionState) {
+                    is ImuConnectionState.Scanning    -> "Scanning for IMU…"
+                    is ImuConnectionState.Connecting  -> "Connecting to ${(imuConnectionState as ImuConnectionState.Connecting).deviceName}…"
+                    is ImuConnectionState.Connected   -> "✓ IMU connected — ${(imuConnectionState as ImuConnectionState.Connected).deviceName}"
+                    is ImuConnectionState.Error       -> (imuConnectionState as ImuConnectionState.Error).message
+                    is ImuConnectionState.Disconnected -> "No IMU — autopilot uses its own sensor"
+                }
+                val imuColor = when (imuConnectionState) {
+                    is ImuConnectionState.Connected    -> GreenGo
+                    is ImuConnectionState.Connecting,
+                    is ImuConnectionState.Scanning     -> TealAccent
+                    is ImuConnectionState.Error        -> RedAlarm
+                    else                               -> Muted
+                }
+                Text(imuText, style = MaterialTheme.typography.bodyMedium, color = imuColor)
+
+                if (imuDevices.isEmpty() && imuConnectionState is ImuConnectionState.Scanning) {
+                    SearchingHint("Searching for IMU sensors…")
+                }
+                imuDevices.forEach { device ->
+                    ImuDeviceCard(device, imuConnectionState) { vm.connectImu(device) }
+                }
+
+                if (imuConnectionState is ImuConnectionState.Connected) {
+                    OutlinedButton(
+                        onClick  = vm::disconnectImu,
+                        modifier = Modifier.fillMaxWidth(),
+                        border   = BorderStroke(1.dp, RedAlarm.copy(alpha = 0.6f)),
+                        colors   = ButtonDefaults.outlinedButtonColors(contentColor = RedAlarm),
+                        shape    = RoundedCornerShape(10.dp)
+                    ) {
+                        Icon(Icons.Default.BluetoothDisabled, null, Modifier.size(16.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("DISCONNECT IMU", style = MaterialTheme.typography.labelLarge)
+                    }
+                }
+
+                Spacer(Modifier.height(8.dp))
             }
         }
     }
 }
 
+// ── Components ────────────────────────────────────────────────────────────────
+
 @Composable
-private fun ScanButton(state: BleConnectionState, onScan: () -> Unit, onStop: () -> Unit) {
-    val scanning = state is BleConnectionState.Scanning
+private fun ScanButton(scanning: Boolean, label: String, onScan: () -> Unit, onStop: () -> Unit) {
     val rotation by rememberInfiniteTransition(label = "spin").animateFloat(
         0f, 360f, infiniteRepeatable(tween(1500, easing = LinearEasing)), label = "r"
     )
     Button(
-        onClick = { if (scanning) onStop() else onScan() },
+        onClick  = { if (scanning) onStop() else onScan() },
         modifier = Modifier.fillMaxWidth(),
-        colors = ButtonDefaults.buttonColors(
+        colors   = ButtonDefaults.buttonColors(
             containerColor = if (scanning) NavyLight else TealAccent,
             contentColor   = if (scanning) TealAccent else NavyDeep
         ),
@@ -111,33 +192,36 @@ private fun ScanButton(state: BleConnectionState, onScan: () -> Unit, onStop: ()
         } else {
             Icon(Icons.Default.Search, null, Modifier.size(18.dp))
             Spacer(Modifier.width(8.dp))
-            Text("START SCAN", style = MaterialTheme.typography.labelLarge)
+            Text(label, style = MaterialTheme.typography.labelLarge)
         }
     }
 }
 
 @Composable
-private fun StatusChip(state: BleConnectionState) {
-    val (text, color) = when (state) {
-        is BleConnectionState.Scanning    -> "Scanning for devices…" to TealAccent
-        is BleConnectionState.Connecting  -> "Connecting to ${state.deviceName}…" to AmberWarn
-        is BleConnectionState.Connected   -> "Connected to ${state.deviceName}" to GreenGo
-        is BleConnectionState.Error       -> state.message to RedAlarm
-        is BleConnectionState.Disconnected -> "Ready — tap Scan to start" to Muted
+private fun SectionHeader(title: String, subtitle: String) {
+    Column {
+        Text(title, style = MaterialTheme.typography.titleLarge, color = Color.White)
+        Text(subtitle, style = MaterialTheme.typography.labelMedium, color = Muted)
     }
-    Text(text, style = MaterialTheme.typography.bodyMedium, color = color)
 }
 
 @Composable
-private fun DeviceCard(device: BleDevice, onConnect: () -> Unit) {
+private fun SearchingHint(message: String) {
+    Box(Modifier.fillMaxWidth().padding(vertical = 8.dp), Alignment.Center) {
+        Text(message, style = MaterialTheme.typography.bodyMedium, color = Muted)
+    }
+}
+
+@Composable
+private fun AutopilotDeviceCard(device: BleDevice, onConnect: () -> Unit) {
     Card(
         modifier = Modifier.fillMaxWidth().clickable { onConnect() },
-        colors = CardDefaults.cardColors(containerColor = SurfaceCard),
-        border = BorderStroke(1.dp, NavyLight),
-        shape  = RoundedCornerShape(12.dp)
+        colors   = CardDefaults.cardColors(containerColor = SurfaceCard),
+        border   = BorderStroke(1.dp, NavyLight),
+        shape    = RoundedCornerShape(12.dp)
     ) {
         Row(
-            modifier = Modifier.padding(16.dp),
+            Modifier.padding(16.dp),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(12.dp)
         ) {
@@ -149,7 +233,7 @@ private fun DeviceCard(device: BleDevice, onConnect: () -> Unit) {
                 },
                 fontSize = 24.sp
             )
-            Column(modifier = Modifier.weight(1f)) {
+            Column(Modifier.weight(1f)) {
                 Text(device.name, style = MaterialTheme.typography.titleMedium, color = Color.White,
                     maxLines = 1, overflow = TextOverflow.Ellipsis)
                 Text(device.address, style = MaterialTheme.typography.labelMedium, color = Muted)
@@ -165,22 +249,55 @@ private fun DeviceCard(device: BleDevice, onConnect: () -> Unit) {
 }
 
 @Composable
+private fun ImuDeviceCard(device: ImuDevice, connectionState: ImuConnectionState, onConnect: () -> Unit) {
+    val isConnected = connectionState is ImuConnectionState.Connected &&
+            (connectionState as ImuConnectionState.Connected).deviceName == device.name
+    Card(
+        modifier = Modifier.fillMaxWidth().clickable(enabled = !isConnected) { onConnect() },
+        colors   = CardDefaults.cardColors(
+            containerColor = if (isConnected) GreenGo.copy(alpha = 0.1f) else SurfaceCard
+        ),
+        border = BorderStroke(1.dp, if (isConnected) GreenGo else NavyLight),
+        shape  = RoundedCornerShape(12.dp)
+    ) {
+        Row(
+            Modifier.padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Text("🧭", fontSize = 24.sp)
+            Column(Modifier.weight(1f)) {
+                Text(device.name,
+                    style = MaterialTheme.typography.titleMedium,
+                    color = if (isConnected) GreenGo else Color.White,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(device.address, style = MaterialTheme.typography.labelMedium, color = Muted)
+            }
+            Column(horizontalAlignment = Alignment.End) {
+                Text("${device.rssi} dBm", style = MaterialTheme.typography.labelMedium, color = TealAccent)
+                if (isConnected) Text("CONNECTED", style = MaterialTheme.typography.labelMedium, color = GreenGo)
+            }
+        }
+    }
+}
+
+@Composable
 private fun PermissionCard(onRequest: () -> Unit) {
     Card(
-        colors = CardDefaults.cardColors(containerColor = SurfaceCard),
-        border = BorderStroke(1.dp, AmberWarn),
-        shape  = RoundedCornerShape(12.dp),
+        colors   = CardDefaults.cardColors(containerColor = SurfaceCard),
+        border   = BorderStroke(1.dp, AmberWarn),
+        shape    = RoundedCornerShape(12.dp),
         modifier = Modifier.fillMaxWidth()
     ) {
         Column(
-            modifier = Modifier.padding(24.dp),
+            Modifier.padding(24.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             Icon(Icons.Default.Bluetooth, null, tint = AmberWarn, modifier = Modifier.size(40.dp))
             Text("Bluetooth Permission Required",
                 style = MaterialTheme.typography.titleLarge, color = Color.White)
-            Text("Grant Bluetooth access to scan for and connect to your autopilot unit.",
+            Text("Grant Bluetooth access to scan for autopilot and IMU devices.",
                 style = MaterialTheme.typography.bodyMedium, color = Muted)
             Button(
                 onClick = onRequest,

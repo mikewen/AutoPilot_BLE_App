@@ -13,12 +13,12 @@ enum class AutopilotType(val displayName: String, val description: String) {
     ),
     DIFF_THRUST(
         displayName = "Differential Thrust",
-        description = "Dual motor / throttle control"
+        description = "Dual ESC / motor control"
     )
 }
 
 // ─────────────────────────────────────────────
-// BLE Connection State
+// Autopilot BLE Connection State
 // ─────────────────────────────────────────────
 
 sealed class BleConnectionState {
@@ -34,6 +34,45 @@ data class BleDevice(
     val address: String,
     val rssi: Int,
     val type: AutopilotType?
+)
+
+// ─────────────────────────────────────────────
+// IMU Sensor — Connection State, Device, Data
+// ─────────────────────────────────────────────
+
+/** Connection state for the separate IMU compass/attitude sensor. */
+sealed class ImuConnectionState {
+    object Disconnected : ImuConnectionState()
+    object Scanning : ImuConnectionState()
+    data class Connecting(val deviceName: String) : ImuConnectionState()
+    data class Connected(val deviceName: String, val rssi: Int) : ImuConnectionState()
+    data class Error(val message: String) : ImuConnectionState()
+}
+
+/**
+ * A discovered IMU device.
+ * Matched by BLE advertised name starting with "IMU_" (e.g. "IMU_PWM", "IMU_compass").
+ */
+data class ImuDevice(
+    val name: String,
+    val address: String,
+    val rssi: Int
+)
+
+/**
+ * Live telemetry from the IMU sensor.
+ *
+ * [heading] is injected into autopilotState.currentHeading when the IMU is connected,
+ * overriding the autopilot controller's own heading characteristic.
+ * [pitch] and [roll] are shown in the dashboard attitude card.
+ * [calibrated] reflects the IMU firmware's calibration status (bit 0 of calibration byte).
+ */
+data class ImuState(
+    val heading:     Float   = 0f,       // degrees 0–359, magnetic compass
+    val pitch:       Float   = 0f,       // degrees, positive = bow up
+    val roll:        Float   = 0f,       // degrees, positive = starboard down
+    val temperature: Float   = 0f,       // °C (optional, 0 if not available)
+    val calibrated:  Boolean = false     // true when IMU reports good calibration
 )
 
 // ─────────────────────────────────────────────
@@ -87,15 +126,12 @@ data class PidConfig(
     val ki: Float = 0.05f,
     val kd: Float = 0.3f,
     val outputLimit: Float = 30f,
-    // Within ±deadbandDeg the controller outputs zero —
-    // prevents motor hunting on a boat that naturally yaws in waves.
     val deadbandDeg: Float = 3.0f,
-    // Off-course alarm threshold (separate from deadband, typically larger)
     val offCourseAlarmDeg: Float = 15.0f
 )
 
 // ─────────────────────────────────────────────
-// Pure-Kotlin PID controller (runs on phone for sim & standalone testing)
+// Pure-Kotlin PID Controller
 // ─────────────────────────────────────────────
 
 class PidController(private var config: PidConfig) {
@@ -104,60 +140,36 @@ class PidController(private var config: PidConfig) {
     private var lastError: Float = 0f
     private var lastTime: Long = System.currentTimeMillis()
 
-    fun updateConfig(c: PidConfig) {
-        config = c
-        integral = 0f   // reset on config change to avoid wind-up spike
-    }
+    fun updateConfig(c: PidConfig) { config = c; integral = 0f }
 
-    fun reset() {
-        integral = 0f
-        lastError = 0f
-        lastTime = System.currentTimeMillis()
-    }
+    fun reset() { integral = 0f; lastError = 0f; lastTime = System.currentTimeMillis() }
 
-    /**
-     * Compute one PID step.
-     * Heading error is wrapped to [-180, +180] so crossing north (e.g. 359°→1°) works correctly.
-     */
     fun compute(currentHeading: Float, targetHeading: Float): PidResult {
         val now = System.currentTimeMillis()
         val dt = ((now - lastTime) / 1000f).coerceIn(0.01f, 0.5f)
         lastTime = now
 
-        // Wrap error to [-180, +180]
         var error = targetHeading - currentHeading
         while (error > 180f)  error -= 360f
         while (error < -180f) error += 360f
 
-        // ── Deadband check ───────────────────────────────────────────────────
         if (kotlin.math.abs(error) <= config.deadbandDeg) {
-            integral = 0f       // anti-windup: zero integral inside deadband
+            integral = 0f
             lastError = error
-            return PidResult(
-                output     = 0f,
-                error      = error,
-                inDeadband = true,
-                offCourse  = kotlin.math.abs(error) > config.offCourseAlarmDeg
-            )
+            return PidResult(0f, error, inDeadband = true,
+                offCourse = kotlin.math.abs(error) > config.offCourseAlarmDeg)
         }
 
-        // ── Proportional ─────────────────────────────────────────────────────
         val p = config.kp * error
-
-        // ── Integral with anti-windup clamp ──────────────────────────────────
         integral += error * dt
-        val maxIntegral = config.outputLimit / config.ki.coerceAtLeast(0.001f)
-        integral = integral.coerceIn(-maxIntegral, maxIntegral)
+        val maxI = config.outputLimit / config.ki.coerceAtLeast(0.001f)
+        integral = integral.coerceIn(-maxI, maxI)
         val i = config.ki * integral
-
-        // ── Derivative ───────────────────────────────────────────────────────
         val d = config.kd * (error - lastError) / dt
         lastError = error
 
-        val output = (p + i + d).coerceIn(-config.outputLimit, config.outputLimit)
-
         return PidResult(
-            output     = output,
+            output     = (p + i + d).coerceIn(-config.outputLimit, config.outputLimit),
             error      = error,
             inDeadband = false,
             offCourse  = kotlin.math.abs(error) > config.offCourseAlarmDeg
@@ -206,9 +218,8 @@ object BleCommand {
         return byteArrayOf(CMD_SET_HDG, (hdg shr 8).toByte(), hdg.toByte())
     }
 
-    fun adjustHeading(delta: Int): ByteArray {
-        return byteArrayOf(CMD_ADJUST_HDG, delta.coerceIn(-10, 10).toByte())
-    }
+    fun adjustHeading(delta: Int): ByteArray =
+        byteArrayOf(CMD_ADJUST_HDG, delta.coerceIn(-10, 10).toByte())
 
     fun setPid(config: PidConfig): ByteArray {
         fun f(v: Float) = (v * 100).toInt().coerceIn(0, 9999)
@@ -221,7 +232,6 @@ object BleCommand {
         )
     }
 
-    /** Deadband encoded as tenths of a degree (e.g. 2.0° → 20) */
     fun setDeadband(degrees: Float): ByteArray {
         val v = (degrees * 10).toInt().coerceIn(0, 900)
         return byteArrayOf(CMD_SET_DEADBAND, (v shr 8).toByte(), v.toByte())
@@ -231,12 +241,17 @@ object BleCommand {
 // ─────────────────────────────────────────────────────────────────────────────
 // BLE UUIDs
 //
-// Device naming convention (BLE advertised name):
+// Autopilot device naming (BLE advertised name):
 //   "BLE_tiller"           → Tiller autopilot  (linear motor + rudder sensor)
-//   "ESC_PWM" / "BLDC_PWM" → Differential thrust autopilot (dual motor / ESC)
+//   "ESC_PWM" / "BLDC_PWM" → Differential thrust autopilot (dual ESC/motor)
 //
-// Each device type has its own service UUID so both can be scanned
-// simultaneously without ambiguity.
+// IMU sensor naming:
+//   "IMU_PWM" or any name starting with "IMU_" → IMU compass/attitude sensor
+//   Shared by both autopilot types for heading input.
+//
+// Scanning strategy:
+//   All scans use no service UUID filter — devices are identified by name only.
+//   The ESP32 only needs to set its BLE advertised name correctly.
 // ─────────────────────────────────────────────────────────────────────────────
 
 object BleUuids {
@@ -259,14 +274,22 @@ object BleUuids {
     const val CHAR_PORT_THROTTLE       = "12345678-1234-1234-1234-1234567890b5"  // Notify: port %
     const val CHAR_STBD_THROTTLE       = "12345678-1234-1234-1234-1234567890b6"  // Notify: stbd %
 
-    // ── Standard Battery service (both devices) ───────────────────────────
+    // ── IMU sensor service  (advertised name: "IMU_PWM" or "IMU_*") ──────────
+    // Used by both autopilot types as external compass/heading input.
+    const val SERVICE_IMU              = "12345678-1234-1234-1234-1234567890cc"
+    const val CHAR_IMU_HEADING         = "12345678-1234-1234-1234-1234567890c1"  // Notify: heading × 10 (uint16 BE)
+    const val CHAR_IMU_PITCH_ROLL      = "12345678-1234-1234-1234-1234567890c2"  // Notify: pitch × 10, roll × 10 (int16 BE each)
+    const val CHAR_IMU_CALIBRATION     = "12345678-1234-1234-1234-1234567890c3"  // Notify: bit0=calibrated, bits1-2=quality
+    const val CHAR_IMU_TEMPERATURE     = "12345678-1234-1234-1234-1234567890c4"  // Notify: temp × 10 (int16 BE, optional)
+
+    // ── Standard Battery service (all devices) ────────────────────────────────
     const val SERVICE_BATTERY          = "0000180f-0000-1000-8000-00805f9b34fb"
     const val CHAR_BATTERY_LEVEL       = "00002a19-0000-1000-8000-00805f9b34fb"
 
-    // ── CCCD descriptor (subscribe to notifications) ────────────────────────
+    // ── CCCD descriptor (subscribe to notifications) ──────────────────────────
     const val DESCRIPTOR_CCCD          = "00002902-0000-1000-8000-00805f9b34fb"
 
-    // ── Helpers: resolve correct UUID for the connected device type ───────────
+    // ── Helpers: resolve correct UUID for the connected autopilot type ────────
     fun serviceUuidFor(type: AutopilotType) = when (type) {
         AutopilotType.TILLER      -> SERVICE_TILLER
         AutopilotType.DIFF_THRUST -> SERVICE_DIFF_THRUST
