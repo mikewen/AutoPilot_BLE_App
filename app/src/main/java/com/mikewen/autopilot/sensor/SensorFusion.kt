@@ -45,6 +45,12 @@ class SensorFusion {
 
     var lastGyroZDegS: Float = 0f
 
+    // Raw A1 packet values (LSB counts) — exposed for calibration verification.
+    // Compare: lastRawGz * gyroScaleDegS ≈ lastGyroZDegS (before bias subtraction)
+    var lastRawGx: Short = 0; var lastRawGy: Short = 0; var lastRawGz: Short = 0
+    var lastRawAx: Short = 0; var lastRawAy: Short = 0; var lastRawAz: Short = 0
+    var lastRawMx: Short = 0; var lastRawMy: Short = 0; var lastRawMz: Short = 0
+
     // ── State ─────────────────────────────────────────────────────────────────
 
     data class FusedState(
@@ -406,6 +412,11 @@ class SensorFusion {
         else 0.02f
         lastImuTimeMs = nowMs
 
+        // Store raw LSB values for calibration display before any processing
+        lastRawGx = gx; lastRawGy = gy; lastRawGz = gz
+        lastRawAx = ax; lastRawAy = ay; lastRawAz = az
+        lastRawMx = mx; lastRawMy = my; lastRawMz = mz
+
         val gzCorrected = gz - gyroBiasZ
         val gyroZDegS   = gzCorrected * gyroScaleDegS * (if (gyroZFlipped) -1f else 1f)
         lastGyroZDegS = gyroZDegS
@@ -606,7 +617,7 @@ class SensorFusion {
         val conf     = if (sAccMs > 0f) (speedMs / sAccMs).toFloat().coerceIn(0f, 1f) else 0f
         val hasHdg   = speedKt >= 0.3f && conf > 0.1f
         val heading  = if (hasHdg) ((Math.toDegrees(atan2(ve, vn)) + 360) % 360).toFloat()
-                       else state.headingDeg
+        else state.headingDeg
         val hasFix   = fixOk && fixType >= 2
         if (hasHdg) {
             val fused = applyFilter(heading, 0f, 0.15f, 0.1f)
@@ -624,18 +635,27 @@ class SensorFusion {
     // ── NMEA RMC ──────────────────────────────────────────────────────────────
 
     fun processNmeaRmc(speedKt: Float, cogDeg: Float?, hasFix: Boolean, latDeg: Double?, lonDeg: Double?) {
-        if (hasFix && latDeg != null && lonDeg != null && latDeg != 0.0)
+        // Always update declination from phone GPS position — even when cogDeg is null.
+        // This is the primary way declination gets seeded before any BLE A3 packet arrives.
+        if (latDeg != null && lonDeg != null && latDeg != 0.0)
             updateDeclination(latDeg, lonDeg)
 
-        val hasHdg  = cogDeg != null && speedKt >= 0.3f
-        val heading = if (hasHdg) applyFilter(cogDeg!!, 0f, 0.15f, 0.1f) else state.headingDeg
+        // Phone GPS COG is only used as a very low-weight heading nudge when no IMU/BLE
+        // heading is available. Weight 0.03 means gyro dominates; phone just prevents
+        // indefinite drift when BLE is silent. If cogDeg is null (low speed / poor fix)
+        // we only update speed and position, never heading.
+        val hasHdg  = cogDeg != null && speedKt >= 0.5f
+        val heading = if (hasHdg) applyFilter(cogDeg!!, 0f, 0.03f, 0.1f) else state.headingDeg
 
+        // Always update lat/lon from phone GPS even when hasFix=false —
+        // the position is needed for declination, map centering, and bearing calculation
+        // long before accuracy is good enough to mark as a "fix".
         state = state.copy(
             headingDeg        = heading, speedKnots = speedKt,
             hasHeading        = if (hasHdg) true else state.hasHeading,
             hasFix            = hasFix,
-            latDeg            = latDeg ?: state.latDeg,
-            lonDeg            = lonDeg ?: state.lonDeg,
+            latDeg            = if (latDeg != null && latDeg != 0.0) latDeg else state.latDeg,
+            lonDeg            = if (lonDeg != null && lonDeg != 0.0) lonDeg else state.lonDeg,
             magDeclinationDeg = magDeclinationDeg,
             source            = "nmea",
         )

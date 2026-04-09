@@ -66,14 +66,16 @@ fun MapTargetScreen(
         }
     }
 
-    // Recalculate bearing when tap or GPS changes
+    // Recalculate bearing when tap or GPS changes.
+    // Use fusion state directly — it has lat/lon from phone GPS even before hasFix.
     LaunchedEffect(tappedPoint, gpsData.latDeg, gpsData.lonDeg) {
         val tp = tappedPoint ?: return@LaunchedEffect
-        if (gpsData.hasFix && gpsData.latDeg != 0.0) {
-            bearing    = vm.gpsManager.fusion.bearingTo(
-                gpsData.latDeg, gpsData.lonDeg, tp.latitude, tp.longitude)
-            distanceNm = vm.gpsManager.fusion.haversineNm(
-                gpsData.latDeg, gpsData.lonDeg, tp.latitude, tp.longitude)
+        val fs = vm.gpsManager.fusion.getState()
+        val lat = fs.latDeg.takeIf { it != 0.0 } ?: gpsData.latDeg
+        val lon = fs.lonDeg.takeIf { it != 0.0 } ?: gpsData.lonDeg
+        if (lat != 0.0) {
+            bearing    = vm.gpsManager.fusion.bearingTo(lat, lon, tp.latitude, tp.longitude)
+            distanceNm = vm.gpsManager.fusion.haversineNm(lat, lon, tp.latitude, tp.longitude)
         }
     }
 
@@ -101,9 +103,10 @@ fun MapTargetScreen(
                 // Centre on boat
                 IconButton(onClick = {
                     mapViewRef?.let { mv ->
-                        if (gpsData.hasFix && gpsData.latDeg != 0.0) {
-                            mv.controller.animateTo(GeoPoint(gpsData.latDeg, gpsData.lonDeg))
-                        }
+                        val fs  = vm.gpsManager.fusion.getState()
+                        val lat = fs.latDeg.takeIf { it != 0.0 } ?: gpsData.latDeg
+                        val lon = fs.lonDeg.takeIf { it != 0.0 } ?: gpsData.lonDeg
+                        if (lat != 0.0) mv.controller.animateTo(GeoPoint(lat, lon))
                     }
                 }) {
                     Icon(Icons.Default.MyLocation, "Centre", tint = TealAccent)
@@ -197,8 +200,10 @@ fun MapTargetScreen(
                         controller.setZoom(14.0)
 
                         // Centre on boat or default (Atlantic Ocean start)
-                        val startLat = if (gpsData.hasFix && gpsData.latDeg != 0.0) gpsData.latDeg else 45.0
-                        val startLon = if (gpsData.hasFix && gpsData.lonDeg != 0.0) gpsData.lonDeg else -63.0
+                        // Centre on last known position from SensorFusion (has phone GPS even before fix)
+                        val fs = vm.gpsManager.fusion.getState()
+                        val startLat = fs.latDeg.takeIf { it != 0.0 } ?: gpsData.latDeg.takeIf { it != 0.0 } ?: 45.0
+                        val startLon = fs.lonDeg.takeIf { it != 0.0 } ?: gpsData.lonDeg.takeIf { it != 0.0 } ?: -63.0
                         controller.setCenter(GeoPoint(startLat, startLon))
 
                         // My location overlay (blue dot = boat)

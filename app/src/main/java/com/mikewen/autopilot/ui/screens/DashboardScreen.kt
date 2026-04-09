@@ -73,6 +73,17 @@ fun DashboardScreen(
                 onStandby = vm::standby
             )
 
+            // Manual throttle panel — only for DIFF_THRUST when NOT engaged
+            if (type == AutopilotType.DIFF_THRUST && !state.engaged) {
+                ManualThrottlePanel(
+                    portFeedback = state.portThrottle,
+                    stbdFeedback = state.starboardThrottle,
+                    onEscPwm     = { port, stbd -> vm.sendEscPwm(port, stbd) },
+                    onBldcDuty   = { port, stbd -> vm.sendBldcDuty(port, stbd) },
+                    onHardStop   = vm::hardStop
+                )
+            }
+
             // Larger course adjust buttons
             CourseAdjustRow(vm::portTen, vm::portOne, vm::stbdOne, vm::stbdTen)
 
@@ -559,6 +570,207 @@ private fun LegendDot(color: Color, label: String) {
     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
         Box(Modifier.size(8.dp).background(color, CircleShape))
         Text(label, style = MaterialTheme.typography.labelMedium, color = Muted)
+    }
+}
+
+// ── Manual Throttle Panel (diff-thrust standby mode) ──────────────────────────
+//
+// Allows the user to manually set port and starboard ESC duty while the
+// autopilot is in standby. Two independent sliders + a STOP button.
+// Mode is chosen via a toggle: ESC PWM (500–1000) or BLDC Duty (0–10000).
+//
+// When autopilot engages it takes over the throttle — this panel hides.
+
+@Composable
+private fun ManualThrottlePanel(
+    portFeedback: Float,      // 0–1 echo from autopilotState (ae02 reply)
+    stbdFeedback: Float,
+    onEscPwm:     (Int, Int) -> Unit,
+    onBldcDuty:   (Int, Int) -> Unit,
+    onHardStop:   () -> Unit
+) {
+    var useBldc      by remember { mutableStateOf(false) }
+    var syncedSpeed  by remember { mutableStateOf(false) }   // true = both motors same speed
+    var portFraction by remember { mutableFloatStateOf(0f) }
+    var stbdFraction by remember { mutableFloatStateOf(0f) }
+
+    fun sendCurrent() {
+        val p = portFraction; val s = if (syncedSpeed) p else stbdFraction
+        if (useBldc) {
+            onBldcDuty((p * 10000).toInt(), (s * 10000).toInt())
+        } else {
+            onEscPwm((500 + p * 500).toInt(), (500 + s * 500).toInt())
+        }
+    }
+
+    Card(
+        colors   = CardDefaults.cardColors(containerColor = SurfaceCard),
+        shape    = RoundedCornerShape(12.dp),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+
+            // ── Header row ────────────────────────────────────────────────────
+            Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically) {
+                Text("MANUAL THROTTLE",
+                    style = MaterialTheme.typography.titleLarge, color = AmberWarn)
+                // ESC / BLDC mode toggle
+                Row(verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Text("ESC", style = MaterialTheme.typography.labelMedium,
+                        color = if (!useBldc) TealAccent else Muted)
+                    Switch(
+                        checked         = useBldc,
+                        onCheckedChange = { useBldc = it; sendCurrent() },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor   = TealAccent,
+                            checkedTrackColor   = TealAccent.copy(0.4f),
+                            uncheckedThumbColor = Muted,
+                            uncheckedTrackColor = NavyMid
+                        )
+                    )
+                    Text("BLDC", style = MaterialTheme.typography.labelMedium,
+                        color = if (useBldc) TealAccent else Muted)
+                }
+            }
+
+            // ── SYNC toggle — both motors locked to same speed ─────────────────
+            // When on: PORT slider controls both, STBD slider hidden.
+            // Also shows a single "POWER" master slider when synced.
+            Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically) {
+                Column {
+                    Text("SYNC  (both motors equal)",
+                        style = MaterialTheme.typography.labelLarge, color = Color.White)
+                    Text(
+                        if (syncedSpeed) "Both motors at same power"
+                        else "Independent port / stbd control",
+                        style = MaterialTheme.typography.labelMedium, color = Muted
+                    )
+                }
+                Switch(
+                    checked         = syncedSpeed,
+                    onCheckedChange = {
+                        syncedSpeed = it
+                        if (it) { stbdFraction = portFraction }   // snap stbd to port
+                        sendCurrent()
+                    },
+                    colors = SwitchDefaults.colors(
+                        checkedThumbColor   = GreenGo,
+                        checkedTrackColor   = GreenGo.copy(0.4f),
+                        uncheckedThumbColor = Muted,
+                        uncheckedTrackColor = NavyMid
+                    )
+                )
+            }
+
+            if (syncedSpeed) {
+                // ── Single master power slider ─────────────────────────────────
+                ThrottleSlider(
+                    label    = "POWER  (port + stbd)",
+                    fraction = portFraction,
+                    color    = GreenGo,
+                    onChange = {
+                        portFraction = it
+                        stbdFraction = it
+                        sendCurrent()
+                    }
+                )
+            } else {
+                // ── Independent sliders ────────────────────────────────────────
+                ThrottleSlider(
+                    label    = "PORT",
+                    fraction = portFraction,
+                    color    = TealAccent,
+                    onChange = { portFraction = it; sendCurrent() }
+                )
+                ThrottleSlider(
+                    label    = "STBD",
+                    fraction = stbdFraction,
+                    color    = TealAccent,
+                    onChange = { stbdFraction = it; sendCurrent() }
+                )
+            }
+
+            // ── Current values display ─────────────────────────────────────────
+            Row(Modifier.fillMaxWidth(), Arrangement.SpaceEvenly) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("PORT", style = MaterialTheme.typography.labelMedium, color = Muted)
+                    Text("${(portFraction * 100).toInt()}%",
+                        style = MaterialTheme.typography.headlineMedium,
+                        color = if (portFraction > 0.6f) AmberWarn else TealAccent,
+                        fontWeight = FontWeight.Bold)
+                }
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("STBD", style = MaterialTheme.typography.labelMedium, color = Muted)
+                    val displayStbd = if (syncedSpeed) portFraction else stbdFraction
+                    Text("${(displayStbd * 100).toInt()}%",
+                        style = MaterialTheme.typography.headlineMedium,
+                        color = if (displayStbd > 0.6f) AmberWarn else TealAccent,
+                        fontWeight = FontWeight.Bold)
+                }
+                // Hardware echo
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text("HW ECHO", style = MaterialTheme.typography.labelMedium, color = Muted)
+                    Text("${(portFeedback*100).toInt()} / ${(stbdFeedback*100).toInt()}%",
+                        style = MaterialTheme.typography.titleMedium, color = Muted)
+                }
+            }
+
+            // ── Zero + Hard Stop buttons ───────────────────────────────────────
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(
+                    onClick = {
+                        portFraction = 0f; stbdFraction = 0f; sendCurrent()
+                    },
+                    modifier = Modifier.weight(1f),
+                    border   = BorderStroke(1.dp, Muted.copy(0.5f)),
+                    colors   = ButtonDefaults.outlinedButtonColors(contentColor = Muted),
+                    shape    = RoundedCornerShape(10.dp)
+                ) { Text("ZERO", style = MaterialTheme.typography.labelLarge) }
+
+                Button(
+                    onClick = { portFraction = 0f; stbdFraction = 0f; onHardStop() },
+                    modifier = Modifier.weight(1f),
+                    colors   = ButtonDefaults.buttonColors(
+                        containerColor = RedAlarm, contentColor = Color.White),
+                    shape    = RoundedCornerShape(10.dp)
+                ) {
+                    Icon(Icons.Default.Stop, null, Modifier.size(16.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("HARD STOP", style = MaterialTheme.typography.labelLarge)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ThrottleSlider(label: String, fraction: Float, color: Color = TealAccent, onChange: (Float) -> Unit) {
+    Column {
+        Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
+            Text(label, style = MaterialTheme.typography.labelLarge, color = Color.White)
+            Text(
+                "${(fraction * 100).toInt()}%",
+                style = MaterialTheme.typography.labelLarge,
+                color = when {
+                    fraction < 0.05f -> Muted
+                    fraction < 0.6f  -> color
+                    else             -> AmberWarn
+                }
+            )
+        }
+        Slider(
+            value          = fraction,
+            onValueChange  = onChange,
+            valueRange     = 0f..1f,
+            colors         = SliderDefaults.colors(
+                thumbColor         = color,
+                activeTrackColor   = color,
+                inactiveTrackColor = NavyMid
+            )
+        )
     }
 }
 

@@ -101,10 +101,13 @@ class AutopilotViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun setTargetWaypoint(wp: Waypoint) {
         _targetWaypoint.value = wp
-        // Compute bearing from current position to waypoint and set as target heading
-        val gps = _gpsData.value
-        if (gps.hasFix && gps.latDeg != 0.0) {
-            val bearing = gpsManager.fusion.bearingTo(gps.latDeg, gps.lonDeg, wp.latitude, wp.longitude)
+        // Use SensorFusion state directly — it always has lat/lon from phone GPS
+        // even if hasFix is not yet true (position updates before fix quality improves).
+        val fs = gpsManager.fusion.getState()
+        val lat = fs.latDeg.takeIf { it != 0.0 } ?: _gpsData.value.latDeg
+        val lon = fs.lonDeg.takeIf { it != 0.0 } ?: _gpsData.value.lonDeg
+        if (lat != 0.0) {
+            val bearing = gpsManager.fusion.bearingTo(lat, lon, wp.latitude, wp.longitude)
             setTargetHeading(bearing)
         }
     }
@@ -169,8 +172,13 @@ class AutopilotViewModel(application: Application) : AndroidViewModel(applicatio
     fun setUseKalman(v: Boolean) { gpsManager.fusion.useKalman = v }
 
     // ── Autopilot controls ────────────────────────────────────────────────────
-    fun engage()  = bleManager.engage()
-    fun standby() = bleManager.standby()
+    fun engage()   = bleManager.engage()
+    fun standby()  = bleManager.standby()
+    fun hardStop() = bleManager.hardStop()
+
+    // ── Manual throttle for diff-thrust (used in standby mode) ───────────────
+    fun sendEscPwm(port: Int, stbd: Int)   = bleManager.sendEscPwm(port, stbd)
+    fun sendBldcDuty(port: Int, stbd: Int) = bleManager.sendBldcDuty(port, stbd)
 
     fun portOne() { bleManager.portOne(); _targetHeading.update { ((it - 1f  + 360f) % 360f) } }
     fun portTen() { bleManager.portTen(); _targetHeading.update { ((it - 10f + 360f) % 360f) } }

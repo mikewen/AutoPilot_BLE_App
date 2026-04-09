@@ -34,6 +34,37 @@ class BleManager(private val context: Context) {
     private var bluetoothGatt: BluetoothGatt? = null
     private var connectedType: AutopilotType = AutopilotType.TILLER
 
+    // ── GATT write queue ──────────────────────────────────────────────────────
+    // Standard Android GATT is single-operation: each writeDescriptor / writeCharacteristic
+    // must complete (onDescriptorWrite / onCharacteristicWrite callback) before the next.
+    // We queue pending descriptor writes and drain them one-at-a-time via onDescriptorWrite.
+    // Characteristic writes (commands) are only issued after the queue is empty.
+    private val pendingDescriptorWrites = ArrayDeque<Pair<BluetoothGattDescriptor, ByteArray>>()
+    private var descriptorWriteBusy = false
+
+    private fun queueDescriptorWrite(gatt: BluetoothGatt, desc: BluetoothGattDescriptor, value: ByteArray) {
+        pendingDescriptorWrites.addLast(desc to value)
+        if (!descriptorWriteBusy) drainDescriptorQueue(gatt)
+    }
+
+    private fun drainDescriptorQueue(gatt: BluetoothGatt) {
+        val next = pendingDescriptorWrites.removeFirstOrNull()
+        if (next == null) {
+            descriptorWriteBusy = false
+            return
+        }
+        descriptorWriteBusy = true
+        val (desc, value) = next
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            gatt.writeDescriptor(desc, value)
+        } else {
+            @Suppress("DEPRECATION")
+            desc.value = value
+            @Suppress("DEPRECATION")
+            gatt.writeDescriptor(desc)
+        }
+    }
+
     /**
      * True when the connected device uses the real ae00/ae30 service
      * (hardware running AC6329C firmware — ESC_PWM, BLDC_PWM, BLE_tiller).
@@ -108,10 +139,12 @@ class BleManager(private val context: Context) {
                 name.equals("BLE_tiller", ignoreCase = true)  -> AutopilotType.TILLER
                 name.equals("ESC_PWM",    ignoreCase = true)  -> AutopilotType.DIFF_THRUST
                 name.equals("BLDC_PWM",   ignoreCase = true)  -> AutopilotType.DIFF_THRUST
-                name.contains("GPS_PWM",   ignoreCase = true)  -> AutopilotType.TILLER
+                name.contains("tiller",   ignoreCase = true)  -> AutopilotType.TILLER
                 name.contains("ESC_PWM",  ignoreCase = true)  -> AutopilotType.DIFF_THRUST
                 name.contains("BLDC_PWM", ignoreCase = true)  -> AutopilotType.DIFF_THRUST
-                name.contains("GPS_PWM", ignoreCase = true)  -> AutopilotType.DIFF_THRUST
+                // GPS_PWM — tiller autopilot with integrated GPS module
+                name.equals("GPS_PWM",    ignoreCase = true)  -> AutopilotType.TILLER
+                name.contains("GPS_PWM",  ignoreCase = true)  -> AutopilotType.TILLER
                 else -> null
             } ?: return   // ignore non-autopilot devices
 
@@ -153,6 +186,8 @@ class BleManager(private val context: Context) {
         bluetoothGatt?.close()
         bluetoothGatt = null
         isHardwareProtocol = false
+        pendingDescriptorWrites.clear()
+        descriptorWriteBusy = false
         _connectionState.value = BleConnectionState.Disconnected
         _autopilotState.value  = AutopilotState()
     }
@@ -225,6 +260,12 @@ class BleManager(private val context: Context) {
             if (current is BleConnectionState.Connected)
                 _connectionState.value = current.copy(rssi = rssi)
         }
+
+        // Drain the descriptor write queue — Android GATT requires sequential writes
+        override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+            drainDescriptorQueue(gatt)
+        }
+
     }
 
     // ── Notification setup ────────────────────────────────────────────────────
@@ -290,10 +331,9 @@ class BleManager(private val context: Context) {
         char ?: return
         gatt.setCharacteristicNotification(char, true)
         char.getDescriptor(UUID_CCCD)?.let { desc ->
-            @Suppress("DEPRECATION")
-            desc.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-            @Suppress("DEPRECATION")
-            gatt.writeDescriptor(desc)
+            // Use the queue — writing multiple descriptors back-to-back without waiting
+            // for each onDescriptorWrite callback causes silent failures on Android.
+            queueDescriptorWrite(gatt, desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
         }
     }
 
@@ -420,8 +460,50 @@ class BleManager(private val context: Context) {
         }
     }
 
+    /**
+     * Engage autopilot — sends CMD_ENGAGE (0x01) to the autopilot MCU on ae03.
+     * The MCU takes over motor control. Single-byte command, same on both protocols.
+     */
     fun engage()  = sendCommand(byteArrayOf(BleCommand.CMD_ENGAGE))
+
+    /**
+     * Standby — sends CMD_STANDBY (0x02) to the autopilot MCU.
+     * The MCU stops correcting and holds current throttle/neutral.
+     * This is NOT a hard motor stop — the user still has manual throttle control.
+     */
     fun standby() = sendCommand(byteArrayOf(BleCommand.CMD_STANDBY))
+
+    // ── Manual throttle (diff thrust only) ───────────────────────────────────
+    // When in standby, user can manually command both ESC channels independently.
+    // duty range: 500 (stop/arm) … 1000 (full) for ESC_PWM mode
+    //             0   (stop)     … 10000 (100%) for BLDC_DUTY mode
+
+    /** Send raw ESC PWM duty to both channels. duty: 500–1000 */
+    fun sendEscPwm(portDuty: Int, stbdDuty: Int) {
+        val p = portDuty.coerceIn(500, 1000)
+        val s = stbdDuty.coerceIn(500, 1000)
+        sendCommand(byteArrayOf(
+            MotorController.CMD_ESC_PWM,
+            (p and 0xFF).toByte(), ((p shr 8) and 0xFF).toByte(),
+            (s and 0xFF).toByte(), ((s shr 8) and 0xFF).toByte()
+        ))
+    }
+
+    /** Send BLDC duty to both channels. duty: 0–10000 */
+    fun sendBldcDuty(portDuty: Int, stbdDuty: Int) {
+        val p = portDuty.coerceIn(0, 10000)
+        val s = stbdDuty.coerceIn(0, 10000)
+        sendCommand(byteArrayOf(
+            MotorController.CMD_BLDC_DUTY,
+            (p and 0xFF).toByte(), ((p shr 8) and 0xFF).toByte(),
+            (s and 0xFF).toByte(), ((s shr 8) and 0xFF).toByte()
+        ))
+    }
+
+    /** Emergency hard stop — CMD_STOP 0xFF. Use with care. */
+    fun hardStop() = sendCommand(byteArrayOf(
+        MotorController.CMD_STOP, 0, 0, 0, 0
+    ))
     fun portOne() = sendCommand(byteArrayOf(BleCommand.CMD_ADJUST_HDG, (-1).toByte()))
     fun portTen() = sendCommand(byteArrayOf(BleCommand.CMD_ADJUST_HDG, (-10).toByte()))
     fun stbdOne() = sendCommand(byteArrayOf(BleCommand.CMD_ADJUST_HDG, 1))

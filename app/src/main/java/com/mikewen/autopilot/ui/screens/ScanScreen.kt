@@ -41,12 +41,28 @@ fun ScanScreen(
         if (connectionState is BleConnectionState.Connected) onConnected()
     }
 
+    // On Android 12+ we need both BLE permissions AND ACCESS_FINE_LOCATION.
+    // ACCESS_FINE_LOCATION is required by FusedLocationProviderClient for phone GPS.
+    // Previously we only requested BLE perms on S+, which left GPS permission ungranted
+    // and caused startPhoneGps() to silently fail every time.
     val blePermissions = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
         rememberMultiplePermissionsState(
-            listOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
+            listOf(
+                Manifest.permission.BLUETOOTH_SCAN,
+                Manifest.permission.BLUETOOTH_CONNECT,
+                Manifest.permission.ACCESS_FINE_LOCATION   // needed for phone GPS
+            )
         )
     } else {
         rememberMultiplePermissionsState(listOf(Manifest.permission.ACCESS_FINE_LOCATION))
+    }
+
+    // Re-start phone GPS once location permission is granted.
+    // ViewModel.init() calls startPhoneGps() but permission may not be granted yet at that point.
+    LaunchedEffect(blePermissions.allPermissionsGranted) {
+        if (blePermissions.allPermissionsGranted) {
+            vm.gpsManager.startPhoneGps()
+        }
     }
 
     Column(

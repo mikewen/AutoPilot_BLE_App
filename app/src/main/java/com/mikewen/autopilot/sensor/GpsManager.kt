@@ -191,9 +191,18 @@ class GpsManager(private val context: Context) {
     init {
         fusion.onFusedHeading = { fs ->
             val isPhoneUpdate = fs.source == "nmea"
-            if (!(isPhoneUpdate && currentSource == Source.BLE && !usePhoneGps)) {
+            // IMU-only sources (A1: cf:imu+mag, kf:imu+mag) provide heading but NOT position.
+            // They must not change currentSource — that would block phone GPS permanently.
+            // Only GPS sources (nmea=phone, gnss/casic/A2/A3=BLE) affect currentSource.
+            val isImuOnly = fs.source.contains("imu+mag") || fs.source.contains("kf:imu")
+            val newSource = when {
+                isPhoneUpdate -> Source.PHONE
+                isImuOnly     -> currentSource   // keep existing source — don't claim BLE GPS
+                else          -> Source.BLE
+            }
+            if (!(isPhoneUpdate && currentSource == Source.BLE && !usePhoneGps && !isBleGpsStale())) {
                 currentData = GpsData(
-                    source            = if (isPhoneUpdate) Source.PHONE else Source.BLE,
+                    source            = newSource,
                     speedKnots        = fs.speedKnots,
                     headingDeg        = fs.headingDeg,
                     hasHeading        = fs.hasHeading,
@@ -212,7 +221,7 @@ class GpsManager(private val context: Context) {
                     debugMsg          = fs.debugMsg,
                     bleGpsActive      = !isBleGpsStale()
                 )
-                currentSource = currentData.source
+                if (!isImuOnly) currentSource = newSource   // only GPS sources update currentSource
                 accumulateTrip(currentData)
                 logData(currentData)
                 Log.d(TAG, fs.debugMsg)
@@ -238,16 +247,18 @@ class GpsManager(private val context: Context) {
             if (currentSource == Source.BLE && !usePhoneGps && !isBleGpsStale()) return
 
             val speedKt = loc.speed * 1.94384f
-            val cogDeg  = if (loc.hasBearing() && speedKt >= 2.0f && loc.accuracy < 10f)
-                loc.bearing else null
-            val hasFix  = loc.accuracy < 15f
+            // hasFix: use relaxed threshold (50m) so lat/lon flow through earlier.
+            // Position is always passed to processNmeaRmc regardless — declination
+            // and map centering need a rough position even before a quality fix.
+            val hasFix  = loc.accuracy < 50f
             val sAccMs  = if (loc.hasSpeedAccuracy()) loc.speedAccuracyMetersPerSecond else 0.5f
 
+            // Phone GPS provides speed and position only — never heading/COG.
             fusion.processNmeaRmc(
                 speedKt = speedKt,
-                cogDeg  = cogDeg,
-                hasFix  = hasFix && loc.accuracy < 10f,
-                latDeg  = loc.latitude,
+                cogDeg  = null,          // never use phone COG for heading
+                hasFix  = hasFix,
+                latDeg  = loc.latitude,  // always pass position, even without fix quality
                 lonDeg  = loc.longitude
             )
             currentData = currentData.copy(speedAccMs = sAccMs)
