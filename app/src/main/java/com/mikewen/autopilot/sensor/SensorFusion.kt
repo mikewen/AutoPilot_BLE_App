@@ -135,12 +135,32 @@ class SensorFusion {
         baseDeadbandDeg + seaState * seaDeadbandScale
 
     // ── #2 GPS auto-calibration of MMC5603 ────────────────────────────────────
+    //
+    // Reference heading sources (called from processA2):
+    //
+    //   PQTMTAR (A2) — dual-antenna GNSS heading.
+    //     Trusted when gnssQuality == 4 (RTK fixed), regardless of speed.
+    //     A dual-antenna system gives true vessel heading even at rest.
+    //     Accuracy factor from tarAccDeg: lower acc = higher weight.
+    //
+    //   RMC COG (A3, cached) — course over ground from single-antenna GPS.
+    //     Only trusted when speed > 1.5 m/s (≈ 2.9 kt) AND tarAccDeg < 2°.
+    //     Below that speed, COG is too noisy to be a reliable heading reference.
+    //
+    // Each accepted sample is weighted by its source quality before being
+    // added to the bias window.  The window keeps the last MAG_CAL_WINDOW
+    // weighted bias values.  Once the window is full and stddev < MAG_CAL_STABLE_DEG
+    // the bias is committed.
 
-    private val MAG_CAL_SPEED_KT   = 2.0f
-    private val MAG_CAL_SEA_STATE  = 0.15f
-    private val MAG_CAL_GPS_CONF   = 0.75f
-    private val MAG_CAL_WINDOW     = 30
-    private val MAG_CAL_STABLE_DEG = 5f
+    // RMC speed threshold: 1.5 m/s = ~2.9 kt
+    private val MAG_CAL_RMC_SPEED_MS  = 1.5f          // m/s
+    private val MAG_CAL_RMC_SPEED_KT  = MAG_CAL_RMC_SPEED_MS * 1.94384f
+    // PQTMTAR accuracy threshold — only accept when accuracy is better than this
+    private val MAG_CAL_TAR_ACC_MAX    = 5.0f          // degrees; quality=4 typically 0.1–1°
+    // Sea state gate — don't calibrate in choppy conditions
+    private val MAG_CAL_SEA_STATE      = 0.3f          // relaxed from 0.15 (PQTMTAR is more robust)
+    private val MAG_CAL_WINDOW         = 60            // increased: more samples → more stable
+    private val MAG_CAL_STABLE_DEG     = 3f            // tighter: require 3° stddev
 
     private val magBiasWindow = FloatArray(MAG_CAL_WINDOW)
     private var magBiasIdx    = 0
@@ -150,31 +170,85 @@ class SensorFusion {
     var magCalibrated: Boolean = false
         private set
 
+    /**
+     * Feed one mag-vs-GPS bias sample.
+     * Called from processA2 with the best available reference heading.
+     *
+     * @param tarHeadingDeg   PQTMTAR corrected heading (post misalignment correction)
+     * @param tarAccDeg       PQTMTAR accuracy in degrees (lower = better)
+     * @param gnssQuality     GNSS fix quality (4 = RTK fixed, 6 = DR)
+     * @param rawMagHeading   Raw tilt-compensated mag heading (before bias applied)
+     * @param seaState        Current sea state 0–1
+     */
     private fun updateMagCalibration(
-        gpsHeading: Float, rawMagHeading: Float,
-        speedKt: Float, seaState: Float, gpsConf: Float
+        tarHeadingDeg: Float,
+        tarAccDeg: Float,
+        gnssQuality: Int,
+        rawMagHeading: Float,
+        seaState: Float
     ) {
-        if (speedKt < MAG_CAL_SPEED_KT || seaState > MAG_CAL_SEA_STATE || gpsConf < MAG_CAL_GPS_CONF)
-            return
+        if (seaState > MAG_CAL_SEA_STATE) return
 
-        var bias = gpsHeading - rawMagHeading
+        // ── Determine best reference heading and its weight ───────────────────
+
+        val tarWeight: Float
+        val rmcWeight: Float
+
+        if (gnssQuality == 4 && tarAccDeg < MAG_CAL_TAR_ACC_MAX) {
+            // PQTMTAR RTK fixed — trust at any speed.
+            // Weight scales with accuracy: 1° acc → weight 1.0, 5° acc → weight 0.0
+            tarWeight = (1f - tarAccDeg / MAG_CAL_TAR_ACC_MAX).coerceIn(0.1f, 1.0f)
+        } else {
+            return   // quality < 4 or accuracy too poor — skip this sample
+        }
+
+        // RMC COG supplement: only add if speed > 1.5 m/s and accuracy is high
+        val speedMs = cachedRmcSpeed / 1.94384f   // knots → m/s
+        rmcWeight = if (cachedRmcValid &&
+            speedMs >= MAG_CAL_RMC_SPEED_MS &&
+            tarAccDeg < 2.0f) {
+            // RMC is good — blend with PQTMTAR proportional to speed confidence
+            ((speedMs - MAG_CAL_RMC_SPEED_MS) / 1.5f).coerceIn(0f, 0.5f)
+        } else 0f
+
+        // Blend PQTMTAR + RMC into single reference
+        val refHeading: Float
+        val totalW = tarWeight + rmcWeight
+        if (rmcWeight > 0f) {
+            var diff = cachedRmcHeading - tarHeadingDeg
+            while (diff >  180f) diff -= 360f
+            while (diff < -180f) diff += 360f
+            refHeading = ((tarHeadingDeg + (rmcWeight / totalW) * diff) + 360f) % 360f
+        } else {
+            refHeading = tarHeadingDeg
+        }
+
+        // ── Compute bias and add weighted sample ──────────────────────────────
+        var bias = refHeading - rawMagHeading
         while (bias >  180f) bias -= 360f
         while (bias < -180f) bias += 360f
 
-        magBiasWindow[magBiasIdx] = bias
-        magBiasIdx = (magBiasIdx + 1) % MAG_CAL_WINDOW
-        if (magBiasIdx == 0) magBiasFull = true
+        // Weight the sample — higher-quality samples count more
+        // by repeating them in the window proportional to tarWeight
+        val repeatCount = if (tarWeight > 0.8f) 2 else 1
+        repeat(repeatCount) {
+            magBiasWindow[magBiasIdx] = bias
+            magBiasIdx = (magBiasIdx + 1) % MAG_CAL_WINDOW
+            if (magBiasIdx == 0) magBiasFull = true
+        }
 
         val n = if (magBiasFull) MAG_CAL_WINDOW else magBiasIdx
-        if (n < MAG_CAL_WINDOW) return
+        if (n < MAG_CAL_WINDOW / 2) return   // need at least half window before evaluating
 
-        val mean = magBiasWindow.sum() / n
-        val variance = magBiasWindow.sumOf { ((it - mean) * (it - mean)).toDouble() }.toFloat() / n
-        val stddev = sqrt(variance)
+        val mean = (0 until n).sumOf { magBiasWindow[it].toDouble() }.toFloat() / n
+        var variance = 0f
+        for (i in 0 until n) { val d = magBiasWindow[i] - mean; variance += d * d }
+        val stddev = sqrt(variance / n)
 
         if (stddev < MAG_CAL_STABLE_DEG) {
             magBiasEstimate = mean
             magCalibrated   = true
+            Log.i("SensorFusion", "Mag auto-cal: bias=${"%.2f".format(mean)}° stddev=${"%.2f".format(stddev)}° n=$n tarAcc=${"%.2f".format(tarAccDeg)}° rmc=${rmcWeight > 0f}")
         }
     }
 
@@ -562,7 +636,16 @@ class SensorFusion {
             filterLabel = "CF w=${"%.3f".format(filterW)}"
         }
 
-        updateMagCalibration(blended, state.rawMagHeadingDeg, speedKt, state.seaState, conf)
+        // Auto-calibrate mag using PQTMTAR as primary reference.
+        // Pass correctedTarHdg (post misalignment) and tarAccDeg directly —
+        // the new function decides internally whether to trust PQTMTAR and/or RMC.
+        updateMagCalibration(
+            tarHeadingDeg = correctedTarHdg,
+            tarAccDeg     = tarAccDeg,
+            gnssQuality   = gnssQuality,
+            rawMagHeading = state.rawMagHeadingDeg,
+            seaState      = state.seaState
+        )
 
         state = state.copy(
             headingDeg            = fused,
@@ -585,7 +668,11 @@ class SensorFusion {
     fun processA3(latDeg: Double, lonDeg: Double, speedKt: Float, cogDeg: Float, hasFix: Boolean) {
         cachedRmcSpeed   = speedKt
         cachedRmcHeading = cogDeg
-        cachedRmcValid   = hasFix && speedKt >= 0.5f
+        // RMC COG is only valid as a heading reference when speed > 1.5 m/s (≈ 2.9 kt).
+        // Below that, course-over-ground is too noisy relative to vessel heading.
+        // The 0.5 kt threshold is still used for A2 blending weight (directional weighting),
+        // but mag auto-calibration independently checks the 1.5 m/s gate.
+        cachedRmcValid   = hasFix && speedKt >= 0.5f   // used for A2 blend weight; mag cal checks 1.5 m/s separately
 
         if (hasFix && latDeg != 0.0) updateDeclination(latDeg, lonDeg)
         if (speedKt >= TAR_MISALIGN_SPEED_KT)
