@@ -1,6 +1,7 @@
 package com.mikewen.autopilot.ui.screens
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.core.*
@@ -18,6 +19,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.*
 import com.google.accompanist.permissions.*
+import com.mikewen.autopilot.ble.RemoteManager
 import com.mikewen.autopilot.model.*
 import com.mikewen.autopilot.ui.theme.*
 import com.mikewen.autopilot.viewmodel.AutopilotViewModel
@@ -34,6 +36,8 @@ fun ScanScreen(
     val selectedType       by vm.selectedType.collectAsState()
     val imuConnectionState by vm.imuConnectionState.collectAsState()
     val imuDevices         by vm.scannedImuDevices.collectAsState()
+    val remoteState        by vm.remoteState.collectAsState()
+    val scannedRemotes     by vm.scannedRemotes.collectAsState()
 
     BackHandler { onBack() }
 
@@ -180,6 +184,56 @@ fun ScanScreen(
                 }
 
                 Spacer(Modifier.height(8.dp))
+
+                HorizontalDivider(color = NavyLight, thickness = 1.dp)
+
+                // ── Section 3: LOOKBON Remote ─────────────────────────────────
+                SectionHeader("🎮  LOOKBON REMOTE", "Bluetooth joystick — optional")
+
+                ScanButton(
+                    scanning = remoteState == RemoteManager.RemoteState.SCANNING,
+                    label    = "SCAN FOR REMOTE",
+                    onScan   = vm::startRemoteScan,
+                    onStop   = vm::stopRemoteScan
+                )
+
+                val remoteText = when (remoteState) {
+                    RemoteManager.RemoteState.SCANNING     -> "Scanning for LOOKBON…"
+                    RemoteManager.RemoteState.CONNECTING   -> "Connecting…"
+                    RemoteManager.RemoteState.CONNECTED    -> "✓ Remote connected"
+                    RemoteManager.RemoteState.DISCONNECTED -> "No remote connected"
+                }
+                val remoteColor = when (remoteState) {
+                    RemoteManager.RemoteState.CONNECTED    -> GreenGo
+                    RemoteManager.RemoteState.CONNECTING,
+                    RemoteManager.RemoteState.SCANNING     -> TealAccent
+                    RemoteManager.RemoteState.DISCONNECTED -> Muted
+                }
+                Text(remoteText, style = MaterialTheme.typography.bodyMedium, color = remoteColor)
+
+                if (scannedRemotes.isEmpty() && remoteState == RemoteManager.RemoteState.SCANNING) {
+                    SearchingHint("Searching for LOOKBON remotes…")
+                }
+                scannedRemotes.forEach { device ->
+                    RemoteDeviceCard(device, remoteState == RemoteManager.RemoteState.CONNECTED) {
+                        vm.connectRemote(device)
+                    }
+                }
+                if (remoteState == RemoteManager.RemoteState.CONNECTED) {
+                    OutlinedButton(
+                        onClick  = vm::disconnectRemote,
+                        modifier = Modifier.fillMaxWidth(),
+                        border   = BorderStroke(1.dp, RedAlarm.copy(alpha = 0.6f)),
+                        colors   = ButtonDefaults.outlinedButtonColors(contentColor = RedAlarm),
+                        shape    = RoundedCornerShape(10.dp)
+                    ) {
+                        Icon(Icons.Default.BluetoothDisabled, null, Modifier.size(16.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("DISCONNECT REMOTE", style = MaterialTheme.typography.labelLarge)
+                    }
+                }
+
+                Spacer(Modifier.height(8.dp))
             }
         }
     }
@@ -243,9 +297,10 @@ private fun AutopilotDeviceCard(device: BleDevice, onConnect: () -> Unit) {
         ) {
             Text(
                 when (device.type) {
-                    AutopilotType.TILLER      -> "⚓"
-                    AutopilotType.DIFF_THRUST -> "⚡"
-                    null                      -> "❓"
+                    AutopilotType.TILLER        -> "⚓"
+                    AutopilotType.DIFF_THRUST   -> "⚡"
+                    AutopilotType.THRUST_VECTOR -> "🚀"
+                    null                        -> "❓"
                 },
                 fontSize = 24.sp
             )
@@ -293,6 +348,35 @@ private fun ImuDeviceCard(device: ImuDevice, connectionState: ImuConnectionState
                 Text("${device.rssi} dBm", style = MaterialTheme.typography.labelMedium, color = TealAccent)
                 if (isConnected) Text("CONNECTED", style = MaterialTheme.typography.labelMedium, color = GreenGo)
             }
+        }
+    }
+}
+
+@Composable
+private fun RemoteDeviceCard(
+    device: android.bluetooth.BluetoothDevice,
+    isConnected: Boolean,
+    onConnect: () -> Unit
+) {
+    @SuppressLint("MissingPermission")
+    val name = try { device.name ?: device.address } catch (e: Exception) { device.address }
+    Card(
+        modifier = Modifier.fillMaxWidth().clickable(enabled = !isConnected) { onConnect() },
+        colors   = CardDefaults.cardColors(
+            containerColor = if (isConnected) GreenGo.copy(alpha = 0.1f) else SurfaceCard),
+        border   = BorderStroke(1.dp, if (isConnected) GreenGo else NavyLight),
+        shape    = RoundedCornerShape(12.dp)
+    ) {
+        Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text("🎮", fontSize = 24.sp)
+            Column(Modifier.weight(1f)) {
+                Text(name, style = MaterialTheme.typography.titleMedium,
+                    color = if (isConnected) GreenGo else Color.White,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(device.address, style = MaterialTheme.typography.labelMedium, color = Muted)
+            }
+            if (isConnected) Text("CONNECTED", style = MaterialTheme.typography.labelMedium, color = GreenGo)
         }
     }
 }

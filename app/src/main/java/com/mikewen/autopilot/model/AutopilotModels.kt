@@ -14,6 +14,10 @@ enum class AutopilotType(val displayName: String, val description: String) {
     DIFF_THRUST(
         displayName = "Differential Thrust",
         description = "Dual ESC / motor control"
+    ),
+    THRUST_VECTOR(
+        displayName = "Thrust Vector",
+        description = "Single motor with vectored nozzle / servo rudder"
     )
 }
 
@@ -122,12 +126,33 @@ data class AutopilotState(
 
 @Serializable
 data class PidConfig(
-    val kp: Float = 1.5f,
-    val ki: Float = 0.05f,
-    val kd: Float = 0.3f,
-    val outputLimit: Float = 30f,
-    val deadbandDeg: Float = 3.0f,
-    val offCourseAlarmDeg: Float = 15.0f
+    val kp:                Float = 1.5f,
+    val ki:                Float = 0.05f,
+    val kd:                Float = 0.3f,
+
+    // Output limit in degrees of rudder / throttle differential
+    val outputLimitDeg:    Float = 30f,
+
+    // Rate limit: max change in output per second (°/s).
+    // Prevents sudden large commands that could stall a motor or snap a tiller.
+    // 0 = disabled.
+    val rateLimitDegPerSec: Float = 60f,
+
+    // Heading error smaller than this suppresses PID output and resets integral.
+    val deadbandDeg:       Float = 3.0f,
+
+    // Steering bias: constant offset added to output to compensate for
+    // hull asymmetry or propeller walk. Positive = port correction.
+    val steeringBiasDeg:   Float = 0f,
+
+    // Off-course alarm threshold
+    val offCourseAlarmDeg: Float = 15.0f,
+
+    // Speed scaling: above this speed (knots) the P and D gains are scaled down
+    // proportionally, reaching minSpeedScale at maxScaleSpeedKt.
+    // Set maxScaleSpeedKt = 0 to disable speed scaling.
+    val maxScaleSpeedKt:   Float = 6.0f,    // speed at which scaling reaches minimum
+    val minSpeedScale:     Float = 0.4f     // minimum gain multiplier at high speed
 )
 
 // ─────────────────────────────────────────────
@@ -137,39 +162,93 @@ data class PidConfig(
 class PidController(private var config: PidConfig) {
 
     private var integral: Float = 0f
-    private var lastError: Float = 0f
-    private var lastTime: Long = System.currentTimeMillis()
+    private var lastOutput: Float = 0f
+    private var lastTime:  Long   = System.currentTimeMillis()
 
     fun updateConfig(c: PidConfig) { config = c; integral = 0f }
 
-    fun reset() { integral = 0f; lastError = 0f; lastTime = System.currentTimeMillis() }
+    fun reset() { integral = 0f; lastOutput = 0f; lastTime = System.currentTimeMillis() }
 
-    fun compute(currentHeading: Float, targetHeading: Float): PidResult {
+    /**
+     * Compute PID output.
+     *
+     * @param currentHeading  Current vessel heading in degrees (0–359)
+     * @param targetHeading   Desired heading in degrees (0–359)
+     * @param gyroZDegS       Yaw rate from BLE IMU gyro in °/s.
+     *                        Used directly as the D-term input — much cleaner than
+     *                        differentiating the heading error, which amplifies GPS noise.
+     *                        A positive value means turning to starboard.
+     *                        Pass 0f if gyro is unavailable.
+     * @param speedKnots      Current vessel speed for gain scaling.
+     *                        Pass 0f to disable speed scaling.
+     */
+    fun compute(
+        currentHeading: Float,
+        targetHeading:  Float,
+        gyroZDegS:      Float = 0f,
+        speedKnots:     Float = 0f
+    ): PidResult {
         val now = System.currentTimeMillis()
-        val dt = ((now - lastTime) / 1000f).coerceIn(0.01f, 0.5f)
+        val dt  = ((now - lastTime) / 1000f).coerceIn(0.01f, 0.5f)
         lastTime = now
 
+        // ── Heading error (shortest arc, −180…+180) ───────────────────────────
         var error = targetHeading - currentHeading
-        while (error > 180f)  error -= 360f
+        while (error >  180f) error -= 360f
         while (error < -180f) error += 360f
 
+        // ── Deadband ──────────────────────────────────────────────────────────
         if (kotlin.math.abs(error) <= config.deadbandDeg) {
-            integral = 0f
-            lastError = error
-            return PidResult(0f, error, inDeadband = true,
-                offCourse = kotlin.math.abs(error) > config.offCourseAlarmDeg)
+            integral    = 0f
+            return PidResult(
+                output     = 0f,
+                error      = error,
+                inDeadband = true,
+                offCourse  = kotlin.math.abs(error) > config.offCourseAlarmDeg
+            )
         }
 
-        val p = config.kp * error
+        // ── Speed scaling: reduce P and D aggressiveness at higher speeds ─────
+        // At low speed a boat needs full authority; at planing speed small
+        // corrections are enough and large ones cause uncomfortable yawing.
+        // Scaling does NOT affect Ki — integral keeps correcting steady drift.
+        val speedScale: Float = if (config.maxScaleSpeedKt > 0f && speedKnots > 0f) {
+            val t = ((speedKnots - 0f) / config.maxScaleSpeedKt).coerceIn(0f, 1f)
+            1f - t * (1f - config.minSpeedScale)   // 1.0 at 0 kt → minSpeedScale at maxScaleSpeedKt
+        } else 1f
+
+        // ── P term ────────────────────────────────────────────────────────────
+        val p = config.kp * speedScale * error
+
+        // ── I term (with anti-windup) ─────────────────────────────────────────
         integral += error * dt
-        val maxI = config.outputLimit / config.ki.coerceAtLeast(0.001f)
-        integral = integral.coerceIn(-maxI, maxI)
-        val i = config.ki * integral
-        val d = config.kd * (error - lastError) / dt
-        lastError = error
+        val maxI  = config.outputLimitDeg / config.ki.coerceAtLeast(0.001f)
+        integral  = integral.coerceIn(-maxI, maxI)
+        val i     = config.ki * integral
+
+        // ── D term — uses raw gyro yaw rate, not differentiated error ─────────
+        // gyroZDegS is the rate of heading change: positive = turning to starboard.
+        // We want to damp the rotation toward the target, so:
+        //   if error > 0 (need to turn stbd) and gyro already turning stbd → damp
+        //   D term opposes rapid rotation regardless of error direction.
+        // Negate: a large positive gyro (fast stbd turn) reduces a stbd correction.
+        val d = -config.kd * speedScale * gyroZDegS
+
+        // ── Steering bias ─────────────────────────────────────────────────────
+        val bias = config.steeringBiasDeg
+
+        // ── Raw output ────────────────────────────────────────────────────────
+        val rawOutput = (p + i + d + bias).coerceIn(-config.outputLimitDeg, config.outputLimitDeg)
+
+        // ── Rate limiter ──────────────────────────────────────────────────────
+        val output: Float = if (config.rateLimitDegPerSec > 0f) {
+            val maxDelta = config.rateLimitDegPerSec * dt
+            (rawOutput - lastOutput).coerceIn(-maxDelta, maxDelta) + lastOutput
+        } else rawOutput
+        lastOutput = output
 
         return PidResult(
-            output     = (p + i + d).coerceIn(-config.outputLimit, config.outputLimit),
+            output     = output,
             error      = error,
             inDeadband = false,
             offCourse  = kotlin.math.abs(error) > config.offCourseAlarmDeg
@@ -291,19 +370,23 @@ object BleUuids {
 
     // ── Helpers: resolve correct UUID for the connected autopilot type ────────
     fun serviceUuidFor(type: AutopilotType) = when (type) {
-        AutopilotType.TILLER      -> SERVICE_TILLER
-        AutopilotType.DIFF_THRUST -> SERVICE_DIFF_THRUST
+        AutopilotType.TILLER       -> SERVICE_TILLER
+        AutopilotType.DIFF_THRUST,
+        AutopilotType.THRUST_VECTOR -> SERVICE_DIFF_THRUST  // same hardware, vectored servo
     }
     fun commandCharFor(type: AutopilotType) = when (type) {
-        AutopilotType.TILLER      -> CHAR_TILLER_COMMAND
-        AutopilotType.DIFF_THRUST -> CHAR_THRUST_COMMAND
+        AutopilotType.TILLER       -> CHAR_TILLER_COMMAND
+        AutopilotType.DIFF_THRUST,
+        AutopilotType.THRUST_VECTOR -> CHAR_THRUST_COMMAND
     }
     fun headingCharFor(type: AutopilotType) = when (type) {
-        AutopilotType.TILLER      -> CHAR_TILLER_HEADING
-        AutopilotType.DIFF_THRUST -> CHAR_THRUST_HEADING
+        AutopilotType.TILLER       -> CHAR_TILLER_HEADING
+        AutopilotType.DIFF_THRUST,
+        AutopilotType.THRUST_VECTOR -> CHAR_THRUST_HEADING
     }
     fun stateCharFor(type: AutopilotType) = when (type) {
-        AutopilotType.TILLER      -> CHAR_TILLER_STATE
-        AutopilotType.DIFF_THRUST -> CHAR_THRUST_STATE
+        AutopilotType.TILLER       -> CHAR_TILLER_STATE
+        AutopilotType.DIFF_THRUST,
+        AutopilotType.THRUST_VECTOR -> CHAR_THRUST_STATE
     }
 }

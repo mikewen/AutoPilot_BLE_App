@@ -74,7 +74,7 @@ fun DashboardScreen(
             )
 
             // Manual throttle panel — only for DIFF_THRUST when NOT engaged
-            if (type == AutopilotType.DIFF_THRUST && !state.engaged) {
+            if ((type == AutopilotType.DIFF_THRUST || type == AutopilotType.THRUST_VECTOR) && !state.engaged) {
                 ManualThrottlePanel(
                     portFeedback = state.portThrottle,
                     stbdFeedback = state.starboardThrottle,
@@ -92,9 +92,10 @@ fun DashboardScreen(
             if (imuConn is ImuConnectionState.Connected) ImuAttitudeCard(imuState)
 
             when (type) {
-                AutopilotType.TILLER      -> TillerPanel(state)
-                AutopilotType.DIFF_THRUST -> DiffThrustPanel(state)
-                null                      -> {}
+                AutopilotType.TILLER        -> TillerPanel(state)
+                AutopilotType.DIFF_THRUST   -> DiffThrustPanel(state)
+                AutopilotType.THRUST_VECTOR -> TillerPanel(state)  // single-motor: show rudder/output
+                null                        -> {}
             }
 
             if (state.offCourseAlarm) AlarmBanner(state)
@@ -377,7 +378,7 @@ private fun DeadbandStatusRow(state: AutopilotState, deadbandDeg: Float) {
         }
         Text("±${String.format("%.1f", deadbandDeg)}°", style = MaterialTheme.typography.labelMedium, color = Muted)
         Spacer(Modifier.weight(1f))
-        val pidNorm = (state.pidOutput / 30f).coerceIn(-1f, 1f)
+        val pidNorm = (state.pidOutput / 30f).coerceIn(-1f, 1f)   // 30° is display normaliser only
         Text("PID", style = MaterialTheme.typography.labelMedium, color = Muted)
         Box(Modifier.width(80.dp).height(10.dp).background(NavyMid, RoundedCornerShape(5.dp))) {
             Box(Modifier.fillMaxWidth(abs(pidNorm)).fillMaxHeight()

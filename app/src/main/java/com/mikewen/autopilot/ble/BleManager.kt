@@ -143,8 +143,11 @@ class BleManager(private val context: Context) {
                 name.contains("ESC_PWM",  ignoreCase = true)  -> AutopilotType.DIFF_THRUST
                 name.contains("BLDC_PWM", ignoreCase = true)  -> AutopilotType.DIFF_THRUST
                 // GPS_PWM — tiller autopilot with integrated GPS module
-                name.equals("GPS_PWM",    ignoreCase = true)  -> AutopilotType.TILLER
-                name.contains("GPS_PWM",  ignoreCase = true)  -> AutopilotType.TILLER
+                name.equals("GPS_PWM",       ignoreCase = true)  -> AutopilotType.TILLER
+                name.contains("GPS_PWM",     ignoreCase = true)  -> AutopilotType.TILLER
+                // THRUST_VECTOR — single motor with vectored nozzle / servo rudder
+                name.equals("THRUST_VECTOR", ignoreCase = true)  -> AutopilotType.THRUST_VECTOR
+                name.contains("THRUST_VEC",  ignoreCase = true)  -> AutopilotType.THRUST_VECTOR
                 else -> null
             } ?: return   // ignore non-autopilot devices
 
@@ -313,7 +316,8 @@ class BleManager(private val context: Context) {
                 BleUuids.CHAR_RUDDER_ANGLE,
                 BleUuids.CHAR_LINEAR_MOTOR_STATUS
             )
-            AutopilotType.DIFF_THRUST -> listOf(
+            AutopilotType.DIFF_THRUST,
+            AutopilotType.THRUST_VECTOR -> listOf(
                 BleUuids.CHAR_THRUST_STATE,
                 BleUuids.CHAR_THRUST_HEADING,
                 BleUuids.CHAR_PORT_THROTTLE,

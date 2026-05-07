@@ -36,8 +36,10 @@ fun TypeSelectScreen(onTypeSelected: (AutopilotType) -> Unit) {
     ) {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(32.dp),
-            modifier = Modifier.padding(24.dp)
+            verticalArrangement = Arrangement.spacedBy(24.dp),
+            modifier = Modifier
+                .padding(24.dp)
+                .verticalScroll(rememberScrollState())
         ) {
             // Logo / Title
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
@@ -80,6 +82,13 @@ fun TypeSelectScreen(onTypeSelected: (AutopilotType) -> Unit) {
             AutopilotTypeCard(
                 type = AutopilotType.DIFF_THRUST,
                 icon = "⚡",
+                onSelect = onTypeSelected
+            )
+
+            // Thrust Vector Card
+            AutopilotTypeCard(
+                type = AutopilotType.THRUST_VECTOR,
+                icon = "🚀",
                 onSelect = onTypeSelected
             )
 

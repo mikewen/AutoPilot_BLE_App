@@ -77,8 +77,8 @@ fun SettingsScreen(
                 }
             }
 
-            // ── Deadband ─────────────────────────────────────────────────────
-            SectionCard(title = "DEADBAND") {
+            // ── Deadband & Alarms ──────────────────────────────────────────────
+            SectionCard(title = "DEADBAND & ALARMS") {
                 DeadbandExplainer()
                 Spacer(Modifier.height(4.dp))
                 ParamSlider("Deadband width", pid.deadbandDeg, 0f..15f, "°",
@@ -87,24 +87,77 @@ fun SettingsScreen(
                     "Alarm triggers when error exceeds this threshold", vm::updateOffCourseAlarm)
             }
 
-            // ── PID Tuning ───────────────────────────────────────────────────
-            SectionCard(title = "PID TUNING") {
-                ParamSlider("Kp  Proportional", pid.kp, 0f..5f,   "", "Main correction strength",     vm::updatePidKp)
-                ParamSlider("Ki  Integral",     pid.ki, 0f..1f,   "", "Eliminates steady-state drift", vm::updatePidKi)
-                ParamSlider("Kd  Derivative",   pid.kd, 0f..2f,   "", "Dampens oscillation",           vm::updatePidKd)
-                ParamSlider("Output limit",     pid.outputLimit, 5f..45f, "°", "Max rudder / thrust diff", vm::updateOutputLimit)
+            // ── PID Gains ────────────────────────────────────────────────────
+            SectionCard(title = "PID GAINS") {
+                ParamSlider("Kp  Proportional", pid.kp, 0f..5f,  "",
+                    "Main correction strength — larger = more aggressive", vm::updatePidKp)
+                ParamSlider("Ki  Integral",     pid.ki, 0f..1f,  "",
+                    "Eliminates steady-state drift (e.g. current, wind)", vm::updatePidKi)
+                ParamSlider("Kd  Derivative",   pid.kd, 0f..5f,  "",
+                    "Uses live BLE gyro yaw rate — damps oscillation without GPS noise", vm::updatePidKd)
+            }
 
-                Spacer(Modifier.height(8.dp))
-                Button(
-                    onClick = { vm.applyPid(); snackMessage = "PID + deadband sent to autopilot" },
-                    modifier = Modifier.fillMaxWidth(),
-                    colors   = ButtonDefaults.buttonColors(containerColor = TealAccent, contentColor = NavyDeep),
-                    shape    = RoundedCornerShape(10.dp)
-                ) {
-                    Icon(Icons.Default.Send, null, Modifier.size(18.dp))
-                    Spacer(Modifier.width(8.dp))
-                    Text("APPLY ALL SETTINGS", style = MaterialTheme.typography.labelLarge)
+            // ── Output Limits ────────────────────────────────────────────────
+            SectionCard(title = "OUTPUT LIMITS") {
+                ParamSlider("Output limit", pid.outputLimitDeg, 5f..60f, "°",
+                    "Maximum rudder angle / throttle differential", vm::updateOutputLimit)
+                ParamSlider("Rate limit", pid.rateLimitDegPerSec, 0f..180f, "°/s",
+                    "Max change in output per second — 0 = disabled", vm::updateRateLimit)
+            }
+
+            // ── Steering Correction ──────────────────────────────────────────
+            SectionCard(title = "STEERING CORRECTION") {
+                ParamSlider("Steering bias", pid.steeringBiasDeg, -10f..10f, "°",
+                    "Compensate hull asymmetry or prop walk. + = port, - = stbd",
+                    vm::updateSteeringBias)
+            }
+
+            // ── Speed Scaling ────────────────────────────────────────────────
+            SectionCard(title = "SPEED SCALING") {
+                SpeedScalingExplainer()
+                Spacer(Modifier.height(4.dp))
+                ParamSlider("Full-scale speed", pid.maxScaleSpeedKt, 0f..15f, " kt",
+                    "Speed at which gains are reduced to minimum (0 = disable scaling)",
+                    vm::updateMaxScaleSpeed)
+                ParamSlider("Min gain multiplier", pid.minSpeedScale, 0.1f..1f, "×",
+                    "Gain multiplier applied at full-scale speed (1.0 = no reduction)",
+                    vm::updateMinSpeedScale)
+                // Live preview of current scaling
+                val speedKt = pid.maxScaleSpeedKt
+                val minScale = pid.minSpeedScale
+                if (speedKt > 0f) {
+                    Spacer(Modifier.height(4.dp))
+                    Surface(color = NavyMid, shape = RoundedCornerShape(8.dp)) {
+                        Column(Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                            Text("Scale preview:", style = MaterialTheme.typography.labelMedium, color = Muted)
+                            Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween) {
+                                listOf(0f, speedKt * 0.25f, speedKt * 0.5f, speedKt * 0.75f, speedKt).forEach { spd ->
+                                    val t = (spd / speedKt).coerceIn(0f, 1f)
+                                    val scale = 1f - t * (1f - minScale)
+                                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                        Text("${"%.0f".format(spd)}kt",
+                                            style = MaterialTheme.typography.labelMedium, color = Muted)
+                                        Text("${"%.0f".format(scale * 100)}%",
+                                            style = MaterialTheme.typography.labelLarge,
+                                            color = if (scale > 0.7f) TealAccent else AmberWarn)
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
+            }
+
+            // ── Apply button ─────────────────────────────────────────────────
+            Button(
+                onClick  = { vm.applyPid(); snackMessage = "All settings sent to autopilot" },
+                modifier = Modifier.fillMaxWidth(),
+                colors   = ButtonDefaults.buttonColors(containerColor = TealAccent, contentColor = NavyDeep),
+                shape    = RoundedCornerShape(10.dp)
+            ) {
+                Icon(Icons.Default.Send, null, Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("APPLY ALL SETTINGS", style = MaterialTheme.typography.labelLarge)
             }
 
             // ── About ────────────────────────────────────────────────────────
@@ -121,6 +174,26 @@ fun SettingsScreen(
 // ── Deadband explainer ────────────────────────────────────────────────────────
 
 @Composable
+private fun SpeedScalingExplainer() {
+    Surface(
+        color  = TealAccent.copy(alpha = 0.08f),
+        shape  = RoundedCornerShape(10.dp),
+        border = BorderStroke(1.dp, TealAccent.copy(0.3f))
+    ) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text("What is speed scaling?", style = MaterialTheme.typography.labelLarge, color = TealAccent)
+            Text(
+                "At low speed a boat needs full rudder authority. At higher speeds the same " +
+                        "correction causes uncomfortable yawing or overshoot. Speed scaling reduces " +
+                        "P and D gains proportionally as speed increases, while Ki is unaffected so " +
+                        "steady-state drift is still corrected. Set Full-scale speed = 0 to disable.",
+                style = MaterialTheme.typography.bodyMedium, color = Muted
+            )
+        }
+    }
+}
+
+@Composable
 private fun DeadbandExplainer() {
     Surface(
         color  = AmberWarn.copy(alpha = 0.08f),
@@ -131,8 +204,8 @@ private fun DeadbandExplainer() {
             Text("What is deadband?", style = MaterialTheme.typography.labelLarge, color = AmberWarn)
             Text(
                 "When the heading error is smaller than the deadband, the PID output is forced to zero " +
-                "and the integral is reset. This prevents the motor from hunting (constantly correcting " +
-                "tiny errors caused by waves). Typical values: 1°–5°.",
+                        "and the integral is reset. This prevents the motor from hunting (constantly correcting " +
+                        "tiny errors caused by waves). Typical values: 1°–5°.",
                 style = MaterialTheme.typography.bodyMedium, color = Muted
             )
         }

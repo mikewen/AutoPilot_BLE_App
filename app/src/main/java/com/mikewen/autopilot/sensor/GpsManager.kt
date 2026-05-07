@@ -349,15 +349,24 @@ class GpsManager(private val context: Context) {
                 if (b.size < 17) return
                 lastA2A3TimeMs = System.currentTimeMillis()
                 val quality    = b[5].toInt() and 0xFF
+                // bytes 6–7: solved baseline in mm (uint16 LE), 0 if firmware doesn't send it
+                val solvedBaselineM = if (b.size >= 8)
+                    (buf.getShort(6).toInt() and 0xFFFF) / 1000.0f
+                else 0f
                 val pitch      = buf.getShort(8)  / 100.0f
                 val roll       = buf.getShort(10) / 100.0f
                 val heading    = (buf.getShort(12).toInt() and 0xFFFF) / 100.0f
                 val accHeading = (buf.getShort(14).toInt() and 0xFFFF) / 1000.0f
                 val usedSV     = b[16].toInt() and 0xFF
                 fusion.processA2(
-                    tarHeadingDeg = heading, pitchDeg = pitch, rollDeg = roll,
-                    tarAccDeg = accHeading, gnssQuality = quality,
-                    satellites = usedSV, nowMs = System.currentTimeMillis()
+                    tarHeadingDeg    = heading,
+                    pitchDeg         = pitch,
+                    rollDeg          = roll,
+                    tarAccDeg        = accHeading,
+                    solvedBaselineM  = solvedBaselineM,
+                    gnssQuality      = quality,
+                    satellites       = usedSV,
+                    nowMs            = System.currentTimeMillis()
                 )
             }
             0xA3.toByte() -> {
