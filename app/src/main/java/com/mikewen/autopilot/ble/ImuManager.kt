@@ -11,6 +11,13 @@ import kotlinx.coroutines.flow.*
 import java.util.UUID
 
 private const val TAG = "ImuManager"
+
+// AC6329C hardware service UUIDs — same as on ESC_PWM / GPS_PWM / BLE_tiller
+private val UUID_SVC_AE00 = java.util.UUID.fromString("0000ae00-0000-1000-8000-00805f9b34fb")
+private val UUID_SVC_AE30 = java.util.UUID.fromString("0000ae30-0000-1000-8000-00805f9b34fb")
+private val UUID_AE02     = java.util.UUID.fromString("0000ae02-0000-1000-8000-00805f9b34fb")
+private val UUID_CCCD_IMU = java.util.UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+
 private const val SCAN_PERIOD_MS    = 15_000L
 private const val CONNECT_TIMEOUT_MS = 10_000L
 
@@ -42,6 +49,36 @@ class ImuManager(private val context: Context) {
 
     private var gatt: BluetoothGatt? = null
     private var scanJob: Job? = null
+
+    /**
+     * True when the IMU device uses the real ae00/ae30 service (AC6329C firmware).
+     * IMU_PWM / GPS_PWM / ESC_PWM all use this service and stream A1/A2/A3 on ae02.
+     * False = custom UUID firmware (12345678-...-90cc) with individual c1-c4 characteristics.
+     */
+    private var isHardwareProtocol = false
+
+    // GATT write queue — same as BleManager, needed for descriptor sequencing
+    private val pendingDescWrites = ArrayDeque<Pair<BluetoothGattDescriptor, ByteArray>>()
+    private var descWriteBusy     = false
+
+    private fun queueDescWrite(g: BluetoothGatt, desc: BluetoothGattDescriptor, value: ByteArray) {
+        pendingDescWrites.addLast(desc to value)
+        if (!descWriteBusy) drainDescQueue(g)
+    }
+
+    private fun drainDescQueue(g: BluetoothGatt) {
+        val next = pendingDescWrites.removeFirstOrNull() ?: run { descWriteBusy = false; return }
+        descWriteBusy = true
+        val (desc, value) = next
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            g.writeDescriptor(desc, value)
+        } else {
+            @Suppress("DEPRECATION")
+            desc.value = value
+            @Suppress("DEPRECATION")
+            g.writeDescriptor(desc)
+        }
+    }
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     // ── Public flows ──────────────────────────────────────────────────────────
@@ -141,6 +178,9 @@ class ImuManager(private val context: Context) {
         gatt?.disconnect()
         gatt?.close()
         gatt = null
+        isHardwareProtocol = false
+        pendingDescWrites.clear()
+        descWriteBusy = false
         _connectionState.value = ImuConnectionState.Disconnected
         _imuState.value = ImuState()
     }
@@ -205,28 +245,49 @@ class ImuManager(private val context: Context) {
                 _connectionState.value = s.copy(rssi = rssi)
             }
         }
+
+        override fun onDescriptorWrite(
+            g: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int
+        ) { drainDescQueue(g) }
     }
 
     // ── Enable notifications ──────────────────────────────────────────────────
 
     private fun enableNotifications(g: BluetoothGatt) {
-        val service = g.getService(UUID.fromString(BleUuids.SERVICE_IMU)) ?: run {
-            Log.w(TAG, "IMU service ${BleUuids.SERVICE_IMU} not found — check UUID in firmware")
-            return
-        }
-        listOf(
-            BleUuids.CHAR_IMU_HEADING,
-            BleUuids.CHAR_IMU_PITCH_ROLL,
-            BleUuids.CHAR_IMU_CALIBRATION,
-            BleUuids.CHAR_IMU_TEMPERATURE
-        ).forEach { uuid ->
-            service.getCharacteristic(UUID.fromString(uuid))?.let { char ->
-                g.setCharacteristicNotification(char, true)
-                char.getDescriptor(UUID.fromString(BleUuids.DESCRIPTOR_CCCD))?.let { desc ->
-                    @Suppress("DEPRECATION")
-                    desc.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                    @Suppress("DEPRECATION")
-                    g.writeDescriptor(desc)
+        // Detect hardware protocol: ae00/ae30 = AC6329C chip (IMU_PWM, GPS_PWM, ESC_PWM)
+        val hwSvc = g.getService(UUID_SVC_AE00) ?: g.getService(UUID_SVC_AE30)
+        isHardwareProtocol = hwSvc != null
+
+        Log.d(TAG, "IMU protocol: ${if (isHardwareProtocol) "ae00/ae30 hardware" else "custom UUID"}")
+
+        if (isHardwareProtocol) {
+            // ae02 streams A1/A2/A3 packets — subscribe to it.
+            // All raw bytes are forwarded via onRawBytes → GpsManager.feedAe02Bytes().
+            val ae02 = hwSvc!!.getCharacteristic(UUID_AE02) ?: run {
+                Log.w(TAG, "ae02 not found on IMU device")
+                return
+            }
+            g.setCharacteristicNotification(ae02, true)
+            ae02.getDescriptor(UUID_CCCD_IMU)?.let { desc ->
+                queueDescWrite(g, desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+            }
+            Log.d(TAG, "Subscribed to ae02 on IMU_PWM — A1 packets will flow")
+        } else {
+            // Custom UUID firmware: subscribe to individual c1-c4 characteristics
+            val svc = g.getService(java.util.UUID.fromString(BleUuids.SERVICE_IMU)) ?: run {
+                Log.w(TAG, "IMU service ${BleUuids.SERVICE_IMU} not found")
+                return
+            }
+            listOf(
+                BleUuids.CHAR_IMU_HEADING,
+                BleUuids.CHAR_IMU_PITCH_ROLL,
+                BleUuids.CHAR_IMU_CALIBRATION,
+                BleUuids.CHAR_IMU_TEMPERATURE
+            ).forEach { uuid ->
+                svc.getCharacteristic(java.util.UUID.fromString(uuid))?.let { char ->
+                    g.setCharacteristicNotification(char, true)
+                    char.getDescriptor(java.util.UUID.fromString(BleUuids.DESCRIPTOR_CCCD))
+                        ?.let { desc -> queueDescWrite(g, desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE) }
                 }
             }
         }

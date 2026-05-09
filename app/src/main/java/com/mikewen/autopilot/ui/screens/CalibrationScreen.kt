@@ -74,6 +74,12 @@ fun CalibrationScreen(
     var tiltDeg       by remember { mutableFloatStateOf(0f) }
     var seaState      by remember { mutableFloatStateOf(0f) }
 
+    // Net rotation angle (signed) — CW positive, CCW negative.
+    // Verify gyro scale: rotate exactly 90° CW → should read ≈ +90°.
+    // If CW then CCW the two cancel out → net ≈ 0° confirms symmetry.
+    var gyroNetDeg     by remember { mutableFloatStateOf(0f) }
+    var gyroLastTimeMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
+
     LaunchedEffect(Unit) {
         while (true) {
             rawGx = fusion.lastRawGx.toInt()
@@ -86,12 +92,17 @@ fun CalibrationScreen(
             rawMy = fusion.lastRawMy.toInt()
             rawMz = fusion.lastRawMz.toInt()
             gyroZDegS  = fusion.lastGyroZDegS
+            val now    = System.currentTimeMillis()
+            val dtS    = ((now - gyroLastTimeMs) / 1000f).coerceIn(0f, 0.2f)
+            gyroLastTimeMs = now
+            // Net rotation (signed): CW = positive, CCW = negative
+            if (kotlin.math.abs(gyroZDegS) > 0.3f) gyroNetDeg += gyroZDegS * dtS
             val fs     = fusion.getState()
             headingDeg = fs.headingDeg
             rawMagHdg  = fs.rawMagHeadingDeg
             tiltDeg    = fs.tiltDeg
             seaState   = fs.seaState
-            delay(50)   // 20 Hz
+            delay(50)   // 20 Hz (matches firmware A1 rate)
         }
     }
 
@@ -214,6 +225,25 @@ fun CalibrationScreen(
                 }
 
                 Spacer(Modifier.height(6.dp))
+
+                // Net rotation with reset button
+                Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically) {
+                    Column {
+                        Text("Net rotation  (CW+  CCW−)", style = MaterialTheme.typography.labelMedium, color = Muted)
+                        Text("%+.1f°".format(gyroNetDeg),
+                            fontSize = 28.sp,
+                            fontWeight = FontWeight.Bold,
+                            fontFamily = FontFamily.Monospace,
+                            color = if (kotlin.math.abs(gyroNetDeg) < 5f) Muted else TealAccent)
+                    }
+                    OutlinedButton(
+                        onClick = { gyroNetDeg = 0f },
+                        border = BorderStroke(1.dp, Muted.copy(0.4f)),
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Muted),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                    ) { Text("RESET", style = MaterialTheme.typography.labelMedium) }
+                }
 
                 // Converted Z (yaw) + stillness indicator
                 Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween,
@@ -486,7 +516,7 @@ fun CalibrationScreen(
                             "Rotate slowly at a known rate and verify: raw × scale ≈ actual °/s. " +
                             "Default scale 1/256 means ±32768 LSB = ±128 °/s.")
                 TipRow("🧲", "Verifying mag",
-                    "Rotate 360°: MX and MY should each sweep from negative to positive. " +
+                    "Rotate 360°: MX and MY sweep from negative to positive (A1 at 20 Hz). " +
                             "If one axis barely moves, that axis may be misaligned or faulty.")
                 TipRow("💾", "Auto-saved",
                     "Offsets persist in SharedPreferences and reload on next launch.")

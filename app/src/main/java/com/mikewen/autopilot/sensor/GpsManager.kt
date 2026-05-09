@@ -66,7 +66,9 @@ class GpsManager(private val context: Context) {
         val magDeclinationDeg: Float   = 0f,
         val source2:           String  = "none",   // SensorFusion source label
         val debugMsg:          String  = "",
-        val bleGpsActive:      Boolean = false   // true = BLE A2/A3 fresh within last 5 s
+        val bleGpsActive:      Boolean = false,  // true = BLE A2/A3 fresh within last 5 s
+        val rawMagHeadingDeg:  Float   = 0f,     // tilt-compensated mag before bias/decl
+        val gpsCogDeg:         Float?  = null    // GPS course-over-ground (valid when ≥0.5kt)
     ) {
         val speedKmh: Float get() = speedKnots * 1.852f
         val headingCardinal: String get() = when {
@@ -219,7 +221,9 @@ class GpsManager(private val context: Context) {
                     magDeclinationDeg = fs.magDeclinationDeg,
                     source2           = fs.source,
                     debugMsg          = fs.debugMsg,
-                    bleGpsActive      = !isBleGpsStale()
+                    bleGpsActive      = !isBleGpsStale(),
+                    rawMagHeadingDeg  = fs.rawMagHeadingDeg,
+                    gpsCogDeg         = if (fusion.cachedRmcValid && fusion.cachedRmcSpeed >= 0.5f) fusion.cachedRmcHeading else null
                 )
                 if (!isImuOnly) currentSource = newSource   // only GPS sources update currentSource
                 accumulateTrip(currentData)

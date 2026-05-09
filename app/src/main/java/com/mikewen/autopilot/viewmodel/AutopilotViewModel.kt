@@ -138,7 +138,12 @@ class AutopilotViewModel(application: Application) : AndroidViewModel(applicatio
             }
         }
 
-        gpsManager.onUpdate = { data -> _gpsData.value = data }
+        gpsManager.onUpdate = { data ->
+            // Dispatch on Main so Compose StateFlow collectors update on the UI thread
+            viewModelScope.launch(kotlinx.coroutines.Dispatchers.Main.immediate) {
+                _gpsData.value = data
+            }
+        }
         gpsManager.startPhoneGps()
 
         // ── Wire LookbonRemote → ViewModel actions ────────────────────────────
@@ -220,7 +225,8 @@ class AutopilotViewModel(application: Application) : AndroidViewModel(applicatio
         bleManager.standby()
         remoteManager.notifyEngaged(false)
     }
-    fun hardStop() = bleManager.hardStop()
+    fun hardStop()              = bleManager.hardStop()
+    fun sendRudderStep(step: Int) = bleManager.sendRudderStep(step)
 
     // ── Manual throttle for diff-thrust (used in standby mode) ───────────────
     fun sendEscPwm(port: Int, stbd: Int)   = bleManager.sendEscPwm(port, stbd)

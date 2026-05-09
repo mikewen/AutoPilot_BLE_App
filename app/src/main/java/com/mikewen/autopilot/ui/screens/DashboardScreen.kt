@@ -23,6 +23,9 @@ import com.mikewen.autopilot.sensor.GpsManager
 import com.mikewen.autopilot.ui.theme.*
 import com.mikewen.autopilot.viewmodel.AutopilotViewModel
 import kotlin.math.*
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.foundation.gestures.detectTapGestures
 
 @Composable
 fun DashboardScreen(
@@ -54,10 +57,10 @@ fun DashboardScreen(
         ) {
             // IMU chip when connected
             if (imuConn is ImuConnectionState.Connected)
-                ImuStatusChip(imuConn as ImuConnectionState.Connected, imuState)
+                ImuStatusChip(imuConn as ImuConnectionState.Connected, imuState, gpsData)
 
-            // Compass with larger readouts
-            CompassCard(state.currentHeading, target, pidConfig.deadbandDeg)
+            // Compass with larger readouts + sensor data row
+            CompassCard(state.currentHeading, target, pidConfig.deadbandDeg, gpsData)
 
             // Nav row: speed | error | dist/ETA (no battery)
             NavDataRow(state, gpsData, targetWp)
@@ -73,8 +76,9 @@ fun DashboardScreen(
                 onStandby = vm::standby
             )
 
-            // Manual throttle panel — only for DIFF_THRUST when NOT engaged
-            if ((type == AutopilotType.DIFF_THRUST || type == AutopilotType.THRUST_VECTOR) && !state.engaged) {
+            // Manual throttle panel — only for DIFF_THRUST (dual motor) when NOT engaged
+            // THRUST_VECTOR = single vectored motor, controlled like a tiller — no manual throttle
+            if (type == AutopilotType.DIFF_THRUST && !state.engaged) {
                 ManualThrottlePanel(
                     portFeedback = state.portThrottle,
                     stbdFeedback = state.starboardThrottle,
@@ -87,7 +91,15 @@ fun DashboardScreen(
             // Larger course adjust buttons
             CourseAdjustRow(vm::portTen, vm::portOne, vm::stbdOne, vm::stbdTen)
 
-            if (history.size > 5) HeadingChart(history)
+            // Manual steering — hold-to-steer buttons
+            ManualSteeringRow(
+                type     = type,
+                onPort5  = { vm.sendRudderStep(-5) },
+                onPort1  = { vm.sendRudderStep(-1) },
+                onCenter = { vm.sendRudderStep(0) },
+                onStbd1  = { vm.sendRudderStep(1) },
+                onStbd5  = { vm.sendRudderStep(5) }
+            )
 
             if (imuConn is ImuConnectionState.Connected) ImuAttitudeCard(imuState)
 
@@ -99,6 +111,8 @@ fun DashboardScreen(
             }
 
             if (state.offCourseAlarm) AlarmBanner(state)
+
+            if (history.size > 5) HeadingChart(history)
 
             Spacer(Modifier.height(16.dp))
         }
@@ -152,11 +166,22 @@ private fun TopBar(
 // ── IMU status chip ───────────────────────────────────────────────────────────
 
 @Composable
-private fun ImuStatusChip(conn: ImuConnectionState.Connected, imu: ImuState) {
+private fun ImuStatusChip(
+    conn: ImuConnectionState.Connected,
+    imu: ImuState,
+    gpsData: GpsManager.GpsData
+) {
+    // Hardware IMU_PWM on ae00 never sends the calibration characteristic.
+    // Consider it calibrated once heading data is flowing.
+    val hasData   = gpsData.rawMagHeadingDeg > 0f || imu.heading > 0f
+    val calibOk   = imu.calibrated || hasData
+    // Use fused heading (SensorFusion output) when available — more accurate than
+    // raw imu.heading which comes from the custom c1 char (not used on hw protocol)
+    val displayHdg = if (gpsData.hasHeading) gpsData.headingDeg else imu.heading
     Surface(
         color  = GreenGo.copy(0.1f),
         shape  = RoundedCornerShape(10.dp),
-        border = BorderStroke(1.dp, if (imu.calibrated) GreenGo else AmberWarn)
+        border = BorderStroke(1.dp, if (calibOk) GreenGo else AmberWarn)
     ) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 8.dp),
             verticalAlignment = Alignment.CenterVertically,
@@ -165,11 +190,14 @@ private fun ImuStatusChip(conn: ImuConnectionState.Connected, imu: ImuState) {
             Column(Modifier.weight(1f)) {
                 Text("IMU: ${conn.deviceName}",
                     style = MaterialTheme.typography.titleMedium, color = GreenGo)
-                Text(if (imu.calibrated) "Calibrated  •  Heading source" else "Calibrating…",
+                Text(
+                    if (calibOk) "Data OK  •  Heading source"
+                    else "Waiting for data…",
                     style = MaterialTheme.typography.labelMedium,
-                    color = if (imu.calibrated) Muted else AmberWarn)
+                    color = if (calibOk) Muted else AmberWarn
+                )
             }
-            Text("${imu.heading.toInt().toString().padStart(3, '0')}°",
+            Text("${displayHdg.toInt().toString().padStart(3, '0')}°",
                 style = MaterialTheme.typography.headlineMedium, color = GreenGo)
         }
     }
@@ -220,7 +248,7 @@ private fun CalibrationCell(calibrated: Boolean) {
 // ── Compass ───────────────────────────────────────────────────────────────────
 
 @Composable
-private fun CompassCard(currentHeading: Float, targetHeading: Float, deadbandDeg: Float) {
+private fun CompassCard(currentHeading: Float, targetHeading: Float, deadbandDeg: Float, gpsData: GpsManager.GpsData) {
     Card(modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.cardColors(containerColor = SurfaceCard),
         shape  = RoundedCornerShape(16.dp)) {
@@ -234,6 +262,8 @@ private fun CompassCard(currentHeading: Float, targetHeading: Float, deadbandDeg
                 HeadingReadout("CURRENT", currentHeading, TealAccent)
                 HeadingReadout("TARGET",  targetHeading,  AmberWarn)
             }
+            Spacer(Modifier.height(10.dp))
+            SensorDataRow(gpsData)
         }
     }
 }
@@ -328,17 +358,13 @@ private fun NavDataRow(
         } else {
             // No waypoint — show GPS source indicator
             NavDataCard(
-                label      = "GPS SRC",
-                value      = when (gpsData.source) {
-                    GpsManager.Source.BLE   -> "BLE"
-                    GpsManager.Source.PHONE -> "PHONE"
-                    GpsManager.Source.NONE  -> "—"
-                },
+                label      = "TILT",
+                value      = "${String.format("%.1f", gpsData.tiltDeg)}\u00b0",
                 modifier   = Modifier.weight(1f),
-                valueColor = when (gpsData.source) {
-                    GpsManager.Source.BLE   -> GreenGo
-                    GpsManager.Source.PHONE -> AmberWarn
-                    GpsManager.Source.NONE  -> Muted
+                valueColor = when {
+                    gpsData.tiltDeg < 5f  -> TealAccent
+                    gpsData.tiltDeg < 15f -> AmberWarn
+                    else                  -> RedAlarm
                 }
             )
         }
@@ -772,6 +798,119 @@ private fun ThrottleSlider(label: String, fraction: Float, color: Color = TealAc
                 inactiveTrackColor = NavyMid
             )
         )
+    }
+}
+
+// ── Sensor Data Row (rawMag | fused heading | GPS COG) ──────────────────────────
+
+@Composable
+private fun SensorDataRow(gpsData: GpsManager.GpsData) {
+    val rawMag = gpsData.rawMagHeadingDeg.takeIf { it != 0f }
+    val gpsCog = gpsData.gpsCogDeg
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(NavyMid.copy(alpha = 0.6f), RoundedCornerShape(8.dp))
+            .padding(horizontal = 10.dp, vertical = 6.dp),
+        horizontalArrangement = Arrangement.SpaceEvenly,
+        verticalAlignment     = Alignment.CenterVertically
+    ) {
+        SensorReadoutSmall(
+            label = "RAW MAG",
+            value = rawMag?.let { "${it.toInt()}°" } ?: "—",
+            color = if (rawMag != null) TealAccent.copy(0.8f) else Muted
+        )
+        // Divider
+        Box(Modifier.width(1.dp).height(28.dp).background(NavyLight))
+
+        SensorReadoutSmall(
+            label = "FUSED",
+            value = "${gpsData.headingDeg.toInt()}°",
+            color = if (gpsData.hasHeading) GreenGo else Muted
+        )
+        Box(Modifier.width(1.dp).height(28.dp).background(NavyLight))
+
+        SensorReadoutSmall(
+            label = "GPS COG",
+            value = gpsCog?.let { "${it.toInt()}°" } ?: "—",
+            color = if (gpsCog != null) AmberWarn else Muted
+        )
+    }
+}
+
+@Composable
+private fun SensorReadoutSmall(label: String, value: String, color: Color) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(label, style = MaterialTheme.typography.labelMedium,
+            color = Muted, fontSize = 9.sp)
+        Text(value, style = MaterialTheme.typography.titleMedium,
+            color = color, fontWeight = FontWeight.Bold)
+    }
+}
+
+// ── Manual Steering Row ───────────────────────────────────────────────────────
+// Hold ◀ or ▶ to continuously send 1° course corrections at a fixed interval.
+// Centre button snaps target heading to current heading.
+
+@Composable
+private fun ManualSteeringRow(
+    type:     AutopilotType?,
+    onPort5:  () -> Unit,
+    onPort1:  () -> Unit,
+    onCenter: () -> Unit,
+    onStbd1:  () -> Unit,
+    onStbd5:  () -> Unit
+) {
+    val label = when (type) {
+        AutopilotType.TILLER,
+        AutopilotType.THRUST_VECTOR -> "RUDDER / SERVO"
+        AutopilotType.DIFF_THRUST   -> "THRUST STEER"
+        null                        -> "MANUAL STEER"
+    }
+    Card(
+        colors   = CardDefaults.cardColors(containerColor = SurfaceCard),
+        shape    = RoundedCornerShape(12.dp),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
+            Text(label, style = MaterialTheme.typography.labelLarge, color = Muted)
+            Spacer(Modifier.height(8.dp))
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                SteerBtn("L5", onPort5,  Modifier.weight(1f))
+                SteerBtn("L1", onPort1,  Modifier.weight(1f))
+                // Centre / neutral button
+                OutlinedButton(
+                    onClick          = onCenter,
+                    modifier         = Modifier.weight(1f).height(56.dp),
+                    shape            = RoundedCornerShape(8.dp),
+                    border           = BorderStroke(1.dp, Muted.copy(0.4f)),
+                    colors           = ButtonDefaults.outlinedButtonColors(contentColor = Muted),
+                    contentPadding   = PaddingValues(0.dp)
+                ) {
+                    Text("⊙", fontSize = 22.sp, color = Muted)
+                }
+                SteerBtn("R1", onStbd1, Modifier.weight(1f))
+                SteerBtn("R5", onStbd5, Modifier.weight(1f))
+            }
+        }
+    }
+}
+
+@Composable
+private fun SteerBtn(label: String, onClick: () -> Unit, modifier: Modifier) {
+    Button(
+        onClick        = onClick,
+        modifier       = modifier.height(56.dp),
+        shape          = RoundedCornerShape(8.dp),
+        colors         = ButtonDefaults.buttonColors(
+            containerColor = NavyMid, contentColor = TealAccent),
+        contentPadding = PaddingValues(0.dp)
+    ) {
+        Text(label, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
     }
 }
 

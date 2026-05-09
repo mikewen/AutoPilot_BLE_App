@@ -139,7 +139,7 @@ class BleManager(private val context: Context) {
                 name.equals("BLE_tiller", ignoreCase = true)  -> AutopilotType.TILLER
                 name.equals("ESC_PWM",    ignoreCase = true)  -> AutopilotType.DIFF_THRUST
                 name.equals("BLDC_PWM",   ignoreCase = true)  -> AutopilotType.DIFF_THRUST
-                name.contains("tiller",   ignoreCase = true)  -> AutopilotType.TILLER
+                name.contains("GPS_Steer",   ignoreCase = true)  -> AutopilotType.TILLER
                 name.contains("ESC_PWM",  ignoreCase = true)  -> AutopilotType.DIFF_THRUST
                 name.contains("BLDC_PWM", ignoreCase = true)  -> AutopilotType.DIFF_THRUST
                 // GPS_PWM — tiller autopilot with integrated GPS module
@@ -468,6 +468,27 @@ class BleManager(private val context: Context) {
      * Engage autopilot — sends CMD_ENGAGE (0x01) to the autopilot MCU on ae03.
      * The MCU takes over motor control. Single-byte command, same on both protocols.
      */
+    /**
+     * Send a rudder / steering step to the hardware.
+     * step < 0 = port, step > 0 = stbd, step == 0 = centre (neutral).
+     * On hardware protocol this is sent as CMD_ADJUST_HDG so the MCU moves
+     * the actuator by that many degrees.  On custom UUID firmware it also
+     * maps to CMD_ADJUST_HDG.
+     * For diff-thrust the MCU interprets the step as a differential bias.
+     */
+    fun sendRudderStep(step: Int) {
+        when {
+            step == 0 -> sendCommand(byteArrayOf(BleCommand.CMD_SET_HDG,
+                0, 0))          // heading=0 signals "centre rudder" to MCU
+            step < 0  -> repeat(kotlin.math.abs(step).coerceAtMost(10)) {
+                sendCommand(byteArrayOf(BleCommand.CMD_ADJUST_HDG, step.coerceIn(-10,-1).toByte()))
+            }
+            else      -> repeat(step.coerceAtMost(10)) {
+                sendCommand(byteArrayOf(BleCommand.CMD_ADJUST_HDG, step.coerceIn(1,10).toByte()))
+            }
+        }
+    }
+
     fun engage()  = sendCommand(byteArrayOf(BleCommand.CMD_ENGAGE))
 
     /**

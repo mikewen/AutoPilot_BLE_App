@@ -836,7 +836,8 @@ class SensorFusion {
     // Cache latest RMC values from A3 packet for blending with A2
     var cachedRmcHeading = 0f
     var cachedRmcSpeed   = 0f
-    private var cachedRmcValid       = false
+    var cachedRmcValid       = false
+        private set
     private var lastRawTarHeadingDeg = 0f   // raw PQTMTAR before misalignment correction
 
     /**

@@ -102,7 +102,7 @@ fun ScanScreen(
             ) {
 
                 // ── Section 1: Autopilot ──────────────────────────────────────
-                SectionHeader("⚓  AUTOPILOT", "BLE_tiller  •  ESC_PWM  •  BLDC_PWM")
+                SectionHeader("⚓  AUTOPILOT", "BLE_tiller • GPS_Steer • ESC_PWM • BLDC_PWM")
 
                 ScanButton(
                     scanning = connectionState is BleConnectionState.Scanning,
