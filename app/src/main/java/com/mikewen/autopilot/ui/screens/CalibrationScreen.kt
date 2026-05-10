@@ -48,6 +48,7 @@ fun CalibrationScreen(
     onBack: () -> Unit
 ) {
     val fusion = vm.fusion
+    val gpsData by vm.gpsData.collectAsState()
 
     // ── BLE connection guard ──────────────────────────────────────────────────
     val bleConn by vm.connectionState.collectAsState()
@@ -80,6 +81,12 @@ fun CalibrationScreen(
     var gyroNetDeg     by remember { mutableFloatStateOf(0f) }
     var gyroLastTimeMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
 
+    // ── Shaft calibration state ─────────────────────────────────────────────
+    var shaftPhase   by remember { mutableStateOf(ShaftCalPhase.IDLE) }
+    var shaftSamples by remember { mutableIntStateOf(0) }
+    var shaftResult  by remember { mutableStateOf("") }
+    var shaftOk      by remember { mutableStateOf(false) }
+
     LaunchedEffect(Unit) {
         while (true) {
             rawGx = fusion.lastRawGx.toInt()
@@ -92,6 +99,8 @@ fun CalibrationScreen(
             rawMy = fusion.lastRawMy.toInt()
             rawMz = fusion.lastRawMz.toInt()
             gyroZDegS  = fusion.lastGyroZDegS
+            if (vm.gpsManager.isShaftCalActive)
+                shaftSamples = vm.gpsManager.shaftCalSampleCount
             val now    = System.currentTimeMillis()
             val dtS    = ((now - gyroLastTimeMs) / 1000f).coerceIn(0f, 0.2f)
             gyroLastTimeMs = now
@@ -117,6 +126,7 @@ fun CalibrationScreen(
     var magSamples        by remember { mutableIntStateOf(0) }
     var magResult         by remember { mutableStateOf("") }
     var magOk             by remember { mutableStateOf(false) }
+
     // Accumulated rotation angle — integrates gyroZ while mag cal is active
     // so the user knows when ~360° has been completed
     var accumulatedRotDeg by remember { mutableFloatStateOf(0f) }
@@ -509,6 +519,94 @@ fun CalibrationScreen(
                 }
             }
 
+            // ── Shaft / Rudder Position Calibration ─────────────────────────────
+            SectionCard("SHAFT / RUDDER POSITION  (GPS_Steer A5)") {
+                val (hiX, hiY) = vm.gpsManager.getShaftHardIron()
+                val shaftAngle = gpsData.shaftAngleDeg
+
+                InstructionBox("⚙", "Sweep rudder full port → full stbd", listOf(
+                    "GPS_Steer device must be connected (A5 packets flowing)",
+                    "Tap START, move rudder to full port limit",
+                    "Then full stbd, then back to centre",
+                    "Tap FINISH — needs ≥ 20 samples"
+                ))
+                Spacer(Modifier.height(8.dp))
+
+                if (shaftAngle != null) {
+                    Surface(color = NavyMid, shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.fillMaxWidth()) {
+                        Row(Modifier.padding(12.dp).fillMaxWidth(),
+                            Arrangement.SpaceBetween, Alignment.CenterVertically) {
+                            Column {
+                                Text("SHAFT ANGLE", style = MaterialTheme.typography.labelMedium, color = Muted)
+                                Text("${"%.1f".format(shaftAngle)}°",
+                                    fontSize = 28.sp, fontWeight = FontWeight.Bold,
+                                    fontFamily = FontFamily.Monospace, color = TealAccent)
+                            }
+                            Column(horizontalAlignment = Alignment.End) {
+                                Text("Hard-iron", style = MaterialTheme.typography.labelMedium, color = Muted)
+                                Text("X=${"%.0f".format(hiX)}  Y=${"%.0f".format(hiY)}",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    fontFamily = FontFamily.Monospace, color = Muted)
+                            }
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                }
+
+                when (shaftPhase) {
+                    ShaftCalPhase.IDLE -> {
+                        if (shaftResult.isNotEmpty()) {
+                            ResultChip(success = shaftOk, message = shaftResult)
+                            Spacer(Modifier.height(8.dp))
+                        }
+                        Button(
+                            onClick  = { shaftResult = ""; shaftSamples = 0; vm.gpsManager.startShaftCal(); shaftPhase = ShaftCalPhase.SWEEPING },
+                            enabled  = hasA1Source,
+                            modifier = Modifier.fillMaxWidth(),
+                            colors   = ButtonDefaults.buttonColors(containerColor = TealAccent, contentColor = NavyDeep),
+                            shape    = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(Icons.Default.PlayArrow, null, Modifier.size(18.dp))
+                            Spacer(Modifier.width(8.dp))
+                            Text("START SHAFT CAL", style = MaterialTheme.typography.labelLarge)
+                        }
+                    }
+                    ShaftCalPhase.SWEEPING -> {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally,
+                            modifier = Modifier.fillMaxWidth()) {
+                            Icon(Icons.Default.Refresh, null, tint = AmberWarn,
+                                modifier = Modifier.size(36.dp).rotate(rotation))
+                            Spacer(Modifier.height(6.dp))
+                            Text("Sweeping… $shaftSamples samples",
+                                style = MaterialTheme.typography.titleMedium, color = AmberWarn)
+                            Text("Move rudder full port → full stbd → centre",
+                                style = MaterialTheme.typography.bodyMedium, color = Muted,
+                                textAlign = TextAlign.Center)
+                        }
+                        Spacer(Modifier.height(8.dp))
+                        Button(
+                            onClick = {
+                                val ok = vm.gpsManager.finishShaftCal()
+                                shaftPhase = ShaftCalPhase.IDLE; shaftOk = ok
+                                val (x, y) = vm.gpsManager.getShaftHardIron()
+                                shaftResult = if (ok)
+                                    "Offset X=${"%.0f".format(x)}  Y=${"%.0f".format(y)}  ($shaftSamples samples)"
+                                else "Not enough samples — sweep full travel"
+                                if (ok) vm.gpsManager.saveCalibration()
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            colors   = ButtonDefaults.buttonColors(containerColor = GreenGo, contentColor = NavyDeep),
+                            shape    = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(Icons.Default.Stop, null, Modifier.size(18.dp))
+                            Spacer(Modifier.width(8.dp))
+                            Text("FINISH — COMPUTE OFFSETS", style = MaterialTheme.typography.labelLarge)
+                        }
+                    }
+                }
+            }
+
             // ── Tips ──────────────────────────────────────────────────────────
             SectionCard("TIPS") {
                 TipRow("📐", "Verifying gyro scale",
@@ -527,8 +625,9 @@ fun CalibrationScreen(
 
 // ── Enums ─────────────────────────────────────────────────────────────────────
 
-private enum class GyroPhase { IDLE, SAMPLING }
-private enum class MagPhase  { IDLE, ROTATING }
+private enum class GyroPhase  { IDLE, SAMPLING }
+private enum class MagPhase   { IDLE, ROTATING }
+private enum class ShaftCalPhase { IDLE, SWEEPING }
 
 // ── Raw value cell — large monospace number ───────────────────────────────────
 

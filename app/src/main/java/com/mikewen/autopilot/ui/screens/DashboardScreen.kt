@@ -918,14 +918,32 @@ private fun SteerBtn(label: String, onClick: () -> Unit, modifier: Modifier) {
 
 @Composable
 fun TillerPanel(state: AutopilotState) {
+    // Use shaft angle from A5 MMC5603 when available; fall back to BLE-reported rudder angle
+    val displayAngle = state.shaftAngleDeg ?: state.rudderAngle
+    val hasShaft     = state.shaftAngleDeg != null
     Card(colors = CardDefaults.cardColors(containerColor = SurfaceCard),
         shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("TILLER", style = MaterialTheme.typography.titleLarge, color = TealAccent)
-            RudderBar(state.rudderAngle)
+            Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically) {
+                Text("TILLER", style = MaterialTheme.typography.titleLarge, color = TealAccent)
+                if (hasShaft) {
+                    Surface(color = GreenGo.copy(0.15f), shape = RoundedCornerShape(6.dp)) {
+                        Text("SHAFT SENSOR",
+                            style = MaterialTheme.typography.labelMedium, color = GreenGo,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp))
+                    }
+                }
+            }
+            RudderBar(displayAngle, label = if (hasShaft) "SHAFT POSITION" else "RUDDER POSITION")
             Row(Modifier.fillMaxWidth(), Arrangement.SpaceEvenly) {
-                DataCell("RUDDER",  "${String.format("%.1f", state.rudderAngle)}°")
-                DataCell("TARGET",  "${String.format("%.1f", state.rudderTarget)}°")
+                if (hasShaft) {
+                    DataCell("SHAFT",   "${String.format("%+.1f", displayAngle)}°")
+                    DataCell("RUDDER",  "${String.format("%.1f", state.rudderAngle)}°")
+                } else {
+                    DataCell("RUDDER",  "${String.format("%.1f", state.rudderAngle)}°")
+                    DataCell("TARGET",  "${String.format("%.1f", state.rudderTarget)}°")
+                }
                 DataCell("PID OUT", String.format("%.2f", state.pidOutput))
             }
         }
@@ -933,12 +951,12 @@ fun TillerPanel(state: AutopilotState) {
 }
 
 @Composable
-private fun RudderBar(angle: Float) {
+private fun RudderBar(angle: Float, label: String = "RUDDER POSITION") {
     val clamped  = angle.coerceIn(-45f, 45f)
     val fraction = (clamped + 45f) / 90f
     val barColor = when { abs(clamped) < 5f -> GreenGo; abs(clamped) < 20f -> AmberWarn; else -> RedAlarm }
     Column {
-        Text("RUDDER POSITION", style = MaterialTheme.typography.labelMedium, color = Muted)
+        Text(label, style = MaterialTheme.typography.labelMedium, color = Muted)
         Spacer(Modifier.height(6.dp))
         Box(Modifier.fillMaxWidth().height(20.dp).background(NavyMid, RoundedCornerShape(10.dp))) {
             Box(Modifier.width(2.dp).fillMaxHeight().align(Alignment.Center).background(Muted))

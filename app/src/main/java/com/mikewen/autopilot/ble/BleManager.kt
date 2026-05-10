@@ -139,7 +139,6 @@ class BleManager(private val context: Context) {
                 name.equals("BLE_tiller", ignoreCase = true)  -> AutopilotType.TILLER
                 name.equals("ESC_PWM",    ignoreCase = true)  -> AutopilotType.DIFF_THRUST
                 name.equals("BLDC_PWM",   ignoreCase = true)  -> AutopilotType.DIFF_THRUST
-                name.contains("GPS_Steer",   ignoreCase = true)  -> AutopilotType.TILLER
                 name.contains("ESC_PWM",  ignoreCase = true)  -> AutopilotType.DIFF_THRUST
                 name.contains("BLDC_PWM", ignoreCase = true)  -> AutopilotType.DIFF_THRUST
                 // GPS_PWM — tiller autopilot with integrated GPS module
@@ -148,6 +147,9 @@ class BleManager(private val context: Context) {
                 // THRUST_VECTOR — single motor with vectored nozzle / servo rudder
                 name.equals("THRUST_VECTOR", ignoreCase = true)  -> AutopilotType.THRUST_VECTOR
                 name.contains("THRUST_VEC",  ignoreCase = true)  -> AutopilotType.THRUST_VECTOR
+                // GPS_Steer — tiller/rudder with integrated GPS + MMC5603 shaft sensor
+                name.contains("GPS_Steer",   ignoreCase = true)  -> AutopilotType.THRUST_VECTOR
+                name.contains("Steer_UART",   ignoreCase = true)  -> AutopilotType.THRUST_VECTOR
                 else -> null
             } ?: return   // ignore non-autopilot devices
 
@@ -468,23 +470,40 @@ class BleManager(private val context: Context) {
      * Engage autopilot — sends CMD_ENGAGE (0x01) to the autopilot MCU on ae03.
      * The MCU takes over motor control. Single-byte command, same on both protocols.
      */
+    // ── GPS_Steer / THRUST_VECTOR steer command ──────────────────────────────
+    //
+    // Firmware protocol (ae03, 3 bytes):
+    //   byte[0]  cmd        = 0x53 ('S') steer command identifier
+    //   byte[1]  side       = 0x4C ('L') port  |  0x52 ('R') stbd  |  0x43 ('C') centre/stop
+    //   byte[2]  duration   = run time in units of 100 ms (0 = stop immediately)
+    //
+    // The MCU drives the actuator for (duration × 100) ms then stops.
+    // step magnitude maps to duration: step 1 → ~100 ms, step 5 → ~500 ms.
+
+    private val STEER_CMD: Byte = 0x53            // 'S'
+    private val STEER_PORT: Byte = 0x4C           // 'L'
+    private val STEER_STBD: Byte = 0x52           // 'R'
+    private val STEER_CENTRE: Byte = 0x43         // 'C'
+
     /**
-     * Send a rudder / steering step to the hardware.
-     * step < 0 = port, step > 0 = stbd, step == 0 = centre (neutral).
-     * On hardware protocol this is sent as CMD_ADJUST_HDG so the MCU moves
-     * the actuator by that many degrees.  On custom UUID firmware it also
-     * maps to CMD_ADJUST_HDG.
-     * For diff-thrust the MCU interprets the step as a differential bias.
+     * Send a rudder / shaft step to GPS_Steer firmware.
+     * step < 0 = port, step > 0 = stbd, step == 0 = centre/stop.
+     * Magnitude (1 or 5) maps to duration in units of 100 ms.
      */
     fun sendRudderStep(step: Int) {
-        when {
-            step == 0 -> sendCommand(byteArrayOf(BleCommand.CMD_SET_HDG,
-                0, 0))          // heading=0 signals "centre rudder" to MCU
-            step < 0  -> repeat(kotlin.math.abs(step).coerceAtMost(10)) {
-                sendCommand(byteArrayOf(BleCommand.CMD_ADJUST_HDG, step.coerceIn(-10,-1).toByte()))
-            }
-            else      -> repeat(step.coerceAtMost(10)) {
-                sendCommand(byteArrayOf(BleCommand.CMD_ADJUST_HDG, step.coerceIn(1,10).toByte()))
+        if (isHardwareProtocol && connectedType == AutopilotType.THRUST_VECTOR) {
+            // GPS_Steer 3-byte protocol
+            val side     = if (step < 0) STEER_PORT else if (step > 0) STEER_STBD else STEER_CENTRE
+            val duration = kotlin.math.abs(step).coerceIn(0, 255).toByte()
+            sendCommand(byteArrayOf(STEER_CMD, side, duration))
+        } else {
+            // Other hardware: use CMD_ADJUST_HDG (autopilot MCU interprets it)
+            when {
+                step == 0 -> sendCommand(byteArrayOf(BleCommand.CMD_SET_HDG, 0, 0))
+                step < 0  -> sendCommand(byteArrayOf(BleCommand.CMD_ADJUST_HDG,
+                    step.coerceIn(-10, -1).toByte()))
+                else      -> sendCommand(byteArrayOf(BleCommand.CMD_ADJUST_HDG,
+                    step.coerceIn(1, 10).toByte()))
             }
         }
     }

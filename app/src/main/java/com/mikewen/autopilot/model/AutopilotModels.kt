@@ -102,8 +102,9 @@ data class AutopilotState(
     val longitude: Double = 0.0,
 
     // Tiller
-    val rudderAngle: Float = 0f,
-    val rudderTarget: Float = 0f,
+    val rudderAngle:    Float  = 0f,
+    val rudderTarget:   Float  = 0f,
+    val shaftAngleDeg:  Float? = null,  // from A5 MMC5603 shaft sensor
 
     // Diff-thrust
     val portThrottle: Float = 0f,

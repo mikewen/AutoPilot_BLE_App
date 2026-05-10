@@ -68,7 +68,8 @@ class GpsManager(private val context: Context) {
         val debugMsg:          String  = "",
         val bleGpsActive:      Boolean = false,  // true = BLE A2/A3 fresh within last 5 s
         val rawMagHeadingDeg:  Float   = 0f,     // tilt-compensated mag before bias/decl
-        val gpsCogDeg:         Float?  = null    // GPS course-over-ground (valid when ≥0.5kt)
+        val gpsCogDeg:         Float?  = null,   // GPS course-over-ground (valid when >=0.5kt)
+        val shaftAngleDeg:     Float?  = null    // rudder/shaft angle from A5 MMC5603
     ) {
         val speedKmh: Float get() = speedKnots * 1.852f
         val headingCardinal: String get() = when {
@@ -88,6 +89,9 @@ class GpsManager(private val context: Context) {
 
     val fusion = SensorFusion()
 
+    private var shaftHardIronX = 0f
+    private var shaftHardIronY = 0f
+
     init {
         // Restore saved magnetic declination from SharedPreferences
         val calPrefs = context.getSharedPreferences("autopilot_calibration", Context.MODE_PRIVATE)
@@ -103,6 +107,8 @@ class GpsManager(private val context: Context) {
         fusion.gyroBiasX = calPrefs.getFloat("gyro_bias_x", 0f)
         fusion.gyroBiasY = calPrefs.getFloat("gyro_bias_y", 0f)
         fusion.gyroBiasZ = calPrefs.getFloat("gyro_bias_z", 0f)
+        shaftHardIronX   = calPrefs.getFloat("shaft_hard_iron_x", 0f)
+        shaftHardIronY   = calPrefs.getFloat("shaft_hard_iron_y", 0f)
 
         // Persist declination whenever auto-updated from GPS
         fusion.onDeclinationUpdated = { decl ->
@@ -110,6 +116,41 @@ class GpsManager(private val context: Context) {
             Log.i(TAG, "Declination saved: ${"%.2f".format(decl)}°")
         }
     }
+
+    // ── Shaft / rudder position sensor (MMC5603 A5 packet) ──────────────────────
+    // Hard-iron offsets for the shaft MMC5603 — separate from the heading MMC5603
+    // Calibration: sweep the rudder full travel, record min/max X/Y
+
+    // Calibration capture state
+    private var shaftCalActive = false
+    private var shaftMinX = Float.MAX_VALUE; private var shaftMaxX = Float.MIN_VALUE
+    private var shaftMinY = Float.MAX_VALUE; private var shaftMaxY = Float.MIN_VALUE
+    private var shaftCalSamples = 0
+
+    // Most recent shaft angle
+    private var lastShaftAngleDeg: Float? = null
+
+    fun startShaftCal() {
+        shaftCalActive = true
+        shaftMinX = Float.MAX_VALUE; shaftMaxX = Float.MIN_VALUE
+        shaftMinY = Float.MAX_VALUE; shaftMaxY = Float.MIN_VALUE
+        shaftCalSamples = 0
+        Log.i(TAG, "Shaft cal started")
+    }
+
+    fun finishShaftCal(): Boolean {
+        shaftCalActive = false
+        if (shaftCalSamples < 20) return false
+        shaftHardIronX = (shaftMinX + shaftMaxX) / 2f
+        shaftHardIronY = (shaftMinY + shaftMaxY) / 2f
+        Log.i(TAG, "Shaft cal: offsetX=%.1f offsetY=%.1f samples=$shaftCalSamples"
+            .format(shaftHardIronX, shaftHardIronY))
+        return true
+    }
+
+    val isShaftCalActive get() = shaftCalActive
+    val shaftCalSampleCount get() = shaftCalSamples
+    fun getShaftHardIron() = Pair(shaftHardIronX, shaftHardIronY)
 
     /** Persist current calibration values to SharedPreferences. */
     fun saveCalibration() {
@@ -120,6 +161,8 @@ class GpsManager(private val context: Context) {
             .putFloat("gyro_bias_x", fusion.gyroBiasX)
             .putFloat("gyro_bias_y", fusion.gyroBiasY)
             .putFloat("gyro_bias_z", fusion.gyroBiasZ)
+            .putFloat("shaft_hard_iron_x", shaftHardIronX)
+            .putFloat("shaft_hard_iron_y", shaftHardIronY)
             .apply()
     }
 
@@ -223,7 +266,8 @@ class GpsManager(private val context: Context) {
                     debugMsg          = fs.debugMsg,
                     bleGpsActive      = !isBleGpsStale(),
                     rawMagHeadingDeg  = fs.rawMagHeadingDeg,
-                    gpsCogDeg         = if (fusion.cachedRmcValid && fusion.cachedRmcSpeed >= 0.5f) fusion.cachedRmcHeading else null
+                    gpsCogDeg         = if (fusion.cachedRmcValid && fusion.cachedRmcSpeed >= 0.5f) fusion.cachedRmcHeading else null,
+                    shaftAngleDeg     = lastShaftAngleDeg
                 )
                 if (!isImuOnly) currentSource = newSource   // only GPS sources update currentSource
                 accumulateTrip(currentData)
@@ -306,7 +350,8 @@ class GpsManager(private val context: Context) {
     fun feedAe02Bytes(bytes: ByteArray) {
         if (bytes.isEmpty()) return
         val b0 = bytes[0]
-        if (b0 == 0xA1.toByte() || b0 == 0xA2.toByte() || b0 == 0xA3.toByte()) {
+        if (b0 == 0xA1.toByte() || b0 == 0xA2.toByte() ||
+            b0 == 0xA3.toByte() || b0 == 0xA5.toByte()) {
             parseAcPacket(bytes); return
         }
         for (b in bytes) {
@@ -389,7 +434,52 @@ class GpsManager(private val context: Context) {
                 }
                 fusion.processA3(lat, lon, speedKt, course, hasFix)
             }
+            0xA5.toByte() -> parseA5Shaft(b)
         }
+    }
+
+    /**
+     * A5 packet — MMC5603 shaft/rudder position sensor (GPS_Steer firmware)
+     *
+     * Layout:
+     *   byte 0:    0xA5 header
+     *   byte 1:    sequence counter (ignored)
+     *   bytes 2-4: X raw 24-bit signed big-endian
+     *   bytes 5-7: Y raw 24-bit signed big-endian
+     *   bytes 8-10:Z raw 24-bit signed big-endian (not used for 2D angle)
+     */
+    private fun parseA5Shaft(b: ByteArray) {
+        if (b.size < 11) return
+
+        fun get24(offset: Int): Float {
+            val raw = (b[offset].toInt() shl 16) or
+                    ((b[offset+1].toInt() and 0xFF) shl 8) or
+                    (b[offset+2].toInt() and 0xFF)
+            // sign-extend from 24-bit
+            val signed = if (raw and 0x800000 != 0) raw or 0xFF000000.toInt() else raw
+            return signed.toFloat()
+        }
+
+        val rawX = get24(2)
+        val rawY = get24(5)
+
+        // Feed calibration if active
+        if (shaftCalActive) {
+            if (rawX < shaftMinX) shaftMinX = rawX
+            if (rawX > shaftMaxX) shaftMaxX = rawX
+            if (rawY < shaftMinY) shaftMinY = rawY
+            if (rawY > shaftMaxY) shaftMaxY = rawY
+            shaftCalSamples++
+        }
+
+        // Apply hard-iron offset and compute angle
+        val cx = rawX - shaftHardIronX
+        val cy = rawY - shaftHardIronY
+        lastShaftAngleDeg = (Math.toDegrees(Math.atan2(cy.toDouble(), cx.toDouble()))).toFloat()
+
+        // Push update so UI refreshes with new shaft angle
+        currentData = currentData.copy(shaftAngleDeg = lastShaftAngleDeg)
+        onUpdate?.invoke(currentData)
     }
 
     private fun convertNmeaToDecimal(nmea: Float): Double {

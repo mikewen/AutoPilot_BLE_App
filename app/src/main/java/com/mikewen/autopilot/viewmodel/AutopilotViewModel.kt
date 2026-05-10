@@ -66,7 +66,8 @@ class AutopilotViewModel(application: Application) : AndroidViewModel(applicatio
                 currentHeading = heading,
                 speedKnots     = if (gps.hasHeading) gps.speedKnots else apState.speedKnots,
                 latitude       = if (gps.hasFix)     gps.latDeg     else apState.latitude,
-                longitude      = if (gps.hasFix)     gps.lonDeg     else apState.longitude
+                longitude      = if (gps.hasFix)     gps.lonDeg     else apState.longitude,
+                shaftAngleDeg  = gps.shaftAngleDeg   // from A5 MMC5603 packet
             )
         } else apState
     }.stateIn(viewModelScope, SharingStarted.Eagerly, AutopilotState())
