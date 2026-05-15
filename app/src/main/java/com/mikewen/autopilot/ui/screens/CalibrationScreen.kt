@@ -526,11 +526,79 @@ fun CalibrationScreen(
 
                 InstructionBox("⚙", "Sweep rudder full port → full stbd", listOf(
                     "GPS_Steer device must be connected (A5 packets flowing)",
-                    "Tap START, move rudder to full port limit",
-                    "Then full stbd, then back to centre",
+                    "Use L5/L1/R1/R5 buttons below to drive the shaft",
+                    "Then tap START and drive full port → full stbd → centre",
                     "Tap FINISH — needs ≥ 20 samples"
                 ))
                 Spacer(Modifier.height(8.dp))
+
+                // ── Steer motor control ───────────────────────────────────────
+                // Lets the user drive the shaft directly during calibration
+                // without needing to use physical tiller / helm.
+                val pid = vm.pidConfig.collectAsState().value
+                Text("STEER MOTOR CONTROL",
+                    style = MaterialTheme.typography.labelLarge, color = Muted)
+                Text("Scale: ${pid.steerScaleMs} ms/step  " +
+                        "L1=${pid.steerScaleMs}ms  L5=${pid.steerScaleMs*5}ms",
+                    style = MaterialTheme.typography.labelMedium, color = Muted)
+                Spacer(Modifier.height(6.dp))
+                Row(
+                    Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    // L5
+                    Button(
+                        onClick = { vm.sendRudderStep(-5) },
+                        modifier = Modifier.weight(1f).height(52.dp),
+                        shape = RoundedCornerShape(8.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = NavyMid, contentColor = TealAccent),
+                        contentPadding = PaddingValues(0.dp)
+                    ) { Text("L5", style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold) }
+                    // L1
+                    Button(
+                        onClick = { vm.sendRudderStep(-1) },
+                        modifier = Modifier.weight(1f).height(52.dp),
+                        shape = RoundedCornerShape(8.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = NavyMid, contentColor = TealAccent),
+                        contentPadding = PaddingValues(0.dp)
+                    ) { Text("L1", style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold) }
+                    // STOP
+                    OutlinedButton(
+                        onClick = { vm.sendRudderStep(0) },
+                        modifier = Modifier.weight(1f).height(52.dp),
+                        shape = RoundedCornerShape(8.dp),
+                        border = BorderStroke(1.dp, RedAlarm.copy(0.6f)),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            contentColor = RedAlarm),
+                        contentPadding = PaddingValues(0.dp)
+                    ) { Text("STOP", style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Bold) }
+                    // R1
+                    Button(
+                        onClick = { vm.sendRudderStep(1) },
+                        modifier = Modifier.weight(1f).height(52.dp),
+                        shape = RoundedCornerShape(8.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = NavyMid, contentColor = TealAccent),
+                        contentPadding = PaddingValues(0.dp)
+                    ) { Text("R1", style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold) }
+                    // R5
+                    Button(
+                        onClick = { vm.sendRudderStep(5) },
+                        modifier = Modifier.weight(1f).height(52.dp),
+                        shape = RoundedCornerShape(8.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = NavyMid, contentColor = TealAccent),
+                        contentPadding = PaddingValues(0.dp)
+                    ) { Text("R5", style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold) }
+                }
+                Spacer(Modifier.height(12.dp))
 
                 if (shaftAngle != null) {
                     Surface(color = NavyMid, shape = RoundedCornerShape(8.dp),

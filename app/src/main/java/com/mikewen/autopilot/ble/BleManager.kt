@@ -477,27 +477,41 @@ class BleManager(private val context: Context) {
     //   byte[1]  side       = 0x4C ('L') port  |  0x52 ('R') stbd  |  0x43 ('C') centre/stop
     //   byte[2]  duration   = run time in units of 100 ms (0 = stop immediately)
     //
-    // The MCU drives the actuator for (duration × 100) ms then stops.
-    // step magnitude maps to duration: step 1 → ~100 ms, step 5 → ~500 ms.
+    // ── GPS_Steer 5-byte steer command ────────────────────────────────────────
+    //
+    // Packet (ae03, 5 bytes):
+    //   byte[0]  's'  0x73  steer command identifier
+    //   byte[1]  side  'L' 0x4C = port  |  'R' 0x52 = stbd  |  'C' 0x43 = stop
+    //   byte[2]  PWM power 0-255 (use 100 for now)
+    //   byte[3]  runtimeMs low  byte  (little-endian uint16)
+    //   byte[4]  runtimeMs high byte
+    //
+    // runtimeMs = steerScaleMs * abs(step)
+    // The MCU runs the actuator motor for runtimeMs milliseconds then stops.
 
-    private val STEER_CMD: Byte = 0x53            // 'S'
-    private val STEER_PORT: Byte = 0x4C           // 'L'
-    private val STEER_STBD: Byte = 0x52           // 'R'
-    private val STEER_CENTRE: Byte = 0x43         // 'C'
+    private val STEER_CMD:    Byte = 0x73   // 's'
+    private val STEER_PORT:   Byte = 0x4C   // 'L'
+    private val STEER_STBD:   Byte = 0x52   // 'R'
+    private val STEER_CENTRE: Byte = 0x43   // 'C'
+    private val STEER_PWM:    Int  = 100    // fixed PWM for now
 
     /**
      * Send a rudder / shaft step to GPS_Steer firmware.
-     * step < 0 = port, step > 0 = stbd, step == 0 = centre/stop.
-     * Magnitude (1 or 5) maps to duration in units of 100 ms.
+     * step < 0 = port,  step > 0 = stbd,  step == 0 = stop.
+     * runtimeMs = steerScaleMs * abs(step)
      */
-    fun sendRudderStep(step: Int) {
+    fun sendRudderStep(step: Int, steerScaleMs: Int = 200) {
         if (isHardwareProtocol && connectedType == AutopilotType.THRUST_VECTOR) {
-            // GPS_Steer 3-byte protocol
-            val side     = if (step < 0) STEER_PORT else if (step > 0) STEER_STBD else STEER_CENTRE
-            val duration = kotlin.math.abs(step).coerceIn(0, 255).toByte()
-            sendCommand(byteArrayOf(STEER_CMD, side, duration))
+            val side      = if (step < 0) STEER_PORT else if (step > 0) STEER_STBD else STEER_CENTRE
+            val runtimeMs = (steerScaleMs * kotlin.math.abs(step)).coerceIn(0, 65535)
+            sendCommand(byteArrayOf(
+                STEER_CMD,
+                side,
+                STEER_PWM.toByte(),
+                (runtimeMs and 0xFF).toByte(),
+                ((runtimeMs shr 8) and 0xFF).toByte()
+            ))
         } else {
-            // Other hardware: use CMD_ADJUST_HDG (autopilot MCU interprets it)
             when {
                 step == 0 -> sendCommand(byteArrayOf(BleCommand.CMD_SET_HDG, 0, 0))
                 step < 0  -> sendCommand(byteArrayOf(BleCommand.CMD_ADJUST_HDG,

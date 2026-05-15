@@ -29,6 +29,7 @@ class SettingsRepository(private val context: Context) {
         private val KEY_OFFCOURSE_ALARM     = floatPreferencesKey("pid_offcourse_alarm_deg")
         private val KEY_MAX_SCALE_SPEED     = floatPreferencesKey("pid_max_scale_speed_kt")
         private val KEY_MIN_SPEED_SCALE     = floatPreferencesKey("pid_min_speed_scale")
+        private val KEY_STEER_SCALE_MS      = intPreferencesKey("steer_scale_ms")
     }
 
     val pidConfigFlow: Flow<PidConfig> = context.dataStore.data
@@ -47,7 +48,8 @@ class SettingsRepository(private val context: Context) {
                 steeringBiasDeg    = prefs[KEY_STEERING_BIAS]   ?: d.steeringBiasDeg,
                 offCourseAlarmDeg  = prefs[KEY_OFFCOURSE_ALARM] ?: d.offCourseAlarmDeg,
                 maxScaleSpeedKt    = prefs[KEY_MAX_SCALE_SPEED] ?: d.maxScaleSpeedKt,
-                minSpeedScale      = prefs[KEY_MIN_SPEED_SCALE] ?: d.minSpeedScale
+                minSpeedScale      = prefs[KEY_MIN_SPEED_SCALE] ?: d.minSpeedScale,
+                steerScaleMs       = prefs[KEY_STEER_SCALE_MS]  ?: d.steerScaleMs
             )
         }
 
@@ -63,6 +65,7 @@ class SettingsRepository(private val context: Context) {
             prefs[KEY_OFFCOURSE_ALARM] = config.offCourseAlarmDeg
             prefs[KEY_MAX_SCALE_SPEED] = config.maxScaleSpeedKt
             prefs[KEY_MIN_SPEED_SCALE] = config.minSpeedScale
+            prefs[KEY_STEER_SCALE_MS]  = config.steerScaleMs
         }
     }
 }

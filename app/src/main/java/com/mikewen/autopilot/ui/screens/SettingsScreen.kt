@@ -148,6 +148,49 @@ fun SettingsScreen(
                 }
             }
 
+            // ── GPS_Steer Steer Motor ─────────────────────────────────────────
+            SectionCard(title = "STEER MOTOR  (GPS_Steer)") {
+                Surface(
+                    color  = TealAccent.copy(alpha = 0.08f),
+                    shape  = RoundedCornerShape(10.dp),
+                    border = BorderStroke(1.dp, TealAccent.copy(0.3f))
+                ) {
+                    Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text("Steer scale", style = MaterialTheme.typography.labelLarge, color = TealAccent)
+                        Text(
+                            "runtimeMs = steerScaleMs \u00d7 abs(step). " +
+                                    "L1/R1 buttons → 1 step, L5/R5 → 5 steps. " +
+                                    "Tune so 1 step moves the rudder ~1\u00b0.",
+                            style = MaterialTheme.typography.bodyMedium, color = Muted
+                        )
+                    }
+                }
+                Spacer(Modifier.height(4.dp))
+                // Integer slider 50..2000 ms — use float internally, cast to Int
+                ParamSlider(
+                    label       = "Steer scale",
+                    value       = pid.steerScaleMs.toFloat(),
+                    range       = 50f..2000f,
+                    unit        = " ms",
+                    description = "Motor run time per step unit (L1/R1 = 1 step, L5/R5 = 5 steps)",
+                    onValueChange = { vm.updateSteerScale(it.toInt()) }
+                )
+                // Live preview: show runtimeMs for each button
+                Surface(color = NavyMid, shape = RoundedCornerShape(8.dp)) {
+                    Row(Modifier.fillMaxWidth().padding(10.dp),
+                        Arrangement.SpaceEvenly) {
+                        listOf(1, 5).forEach { step ->
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text("L$step / R$step",
+                                    style = MaterialTheme.typography.labelMedium, color = Muted)
+                                Text("${pid.steerScaleMs * step} ms",
+                                    style = MaterialTheme.typography.titleMedium, color = TealAccent)
+                            }
+                        }
+                    }
+                }
+            }
+
             // ── Apply button ─────────────────────────────────────────────────
             Button(
                 onClick  = { vm.applyPid(); snackMessage = "All settings sent to autopilot" },

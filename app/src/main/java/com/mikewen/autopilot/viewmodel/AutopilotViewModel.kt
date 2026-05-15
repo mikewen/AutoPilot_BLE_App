@@ -91,6 +91,7 @@ class AutopilotViewModel(application: Application) : AndroidViewModel(applicatio
     fun updateSteeringBias(v: Float)      { updateAndSave(_pidConfig.value.copy(steeringBiasDeg = v)) }
     fun updateMaxScaleSpeed(v: Float)     { updateAndSave(_pidConfig.value.copy(maxScaleSpeedKt = v)) }
     fun updateMinSpeedScale(v: Float)     { updateAndSave(_pidConfig.value.copy(minSpeedScale = v)) }
+    fun updateSteerScale(v: Int)          { updateAndSave(_pidConfig.value.copy(steerScaleMs = v)) }
 
     fun applyPid() {
         val config = _pidConfig.value
@@ -227,7 +228,7 @@ class AutopilotViewModel(application: Application) : AndroidViewModel(applicatio
         remoteManager.notifyEngaged(false)
     }
     fun hardStop()              = bleManager.hardStop()
-    fun sendRudderStep(step: Int) = bleManager.sendRudderStep(step)
+    fun sendRudderStep(step: Int) = bleManager.sendRudderStep(step, _pidConfig.value.steerScaleMs)
 
     // ── Manual throttle for diff-thrust (used in standby mode) ───────────────
     fun sendEscPwm(port: Int, stbd: Int)   = bleManager.sendEscPwm(port, stbd)

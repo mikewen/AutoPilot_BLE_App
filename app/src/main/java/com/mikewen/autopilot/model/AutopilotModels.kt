@@ -153,7 +153,12 @@ data class PidConfig(
     // proportionally, reaching minSpeedScale at maxScaleSpeedKt.
     // Set maxScaleSpeedKt = 0 to disable speed scaling.
     val maxScaleSpeedKt:   Float = 6.0f,    // speed at which scaling reaches minimum
-    val minSpeedScale:     Float = 0.4f     // minimum gain multiplier at high speed
+    val minSpeedScale:     Float = 0.4f,    // minimum gain multiplier at high speed
+
+    // GPS_Steer steer motor scale: runtimeMs = steerScaleMs * abs(step)
+    // step=1 → one small tap, step=5 → larger move
+    // Default 200 ms per step unit — tune to your actuator speed.
+    val steerScaleMs:      Int   = 200
 )
 
 // ─────────────────────────────────────────────

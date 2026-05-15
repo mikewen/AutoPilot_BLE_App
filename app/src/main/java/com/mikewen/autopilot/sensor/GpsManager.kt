@@ -439,31 +439,52 @@ class GpsManager(private val context: Context) {
     }
 
     /**
-     * A5 packet — MMC5603 shaft/rudder position sensor (GPS_Steer firmware)
+     * A5 packet — MMC5603NJ shaft/rudder position sensor (GPS_Steer firmware)
      *
-     * Layout:
-     *   byte 0:    0xA5 header
-     *   byte 1:    sequence counter (ignored)
-     *   bytes 2-4: X raw 24-bit signed big-endian
-     *   bytes 5-7: Y raw 24-bit signed big-endian
-     *   bytes 8-10:Z raw 24-bit signed big-endian (not used for 2D angle)
+     * A5 packet layout (bytes after the 0xA5 header and sequence byte):
+     *   Packet byte:  Firmware source register:
+     *   b[0]          0x00  X[19:12]
+     *   b[1]          0x01  X[11:4]
+     *   b[2]          0x02  Y[19:12]
+     *   b[3]          0x03  Y[11:4]
+     *   b[4]          0x04  Z[19:12]
+     *   b[5]          0x05  Z[11:4]
+     *   b[6]          0x06  X[3:0]  (bits 7:4)
+     *   b[7]          0x07  Y[3:0]  (bits 7:4)
+     *   b[8]          0x08  Z[3:0]  (bits 7:4)
+     *
+     * Full packet including header: 11 bytes
+     *   byte 0  = 0xA5 header
+     *   byte 1  = sequence counter
+     *   bytes 2-10 = 9 register bytes above
+     *
+     * MMC5603NJ outputs are unsigned, centred at 524288 (2^19).
+     * Signed value = unsigned - 524288.
      */
     private fun parseA5Shaft(b: ByteArray) {
         if (b.size < 11) return
 
-        fun get24(offset: Int): Float {
-            val raw = (b[offset].toInt() shl 16) or
-                    ((b[offset+1].toInt() and 0xFF) shl 8) or
-                    (b[offset+2].toInt() and 0xFF)
-            // sign-extend from 24-bit
-            val signed = if (raw and 0x800000 != 0) raw or 0xFF000000.toInt() else raw
-            return signed.toFloat()
-        }
+        // b[0]=header, b[1]=seq — data starts at b[2]
+        val d = b  // use full array; data bytes at indices 2..10
 
-        val rawX = get24(2)
-        val rawY = get24(5)
+        val xUnsigned = ((d[2].toInt() and 0xFF) shl 12) or
+                ((d[3].toInt() and 0xFF) shl 4)  or
+                ((d[8].toInt() and 0xF0) ushr 4)   // X[3:0] in bits 7:4 of reg 0x06
 
-        // Feed calibration if active
+        val yUnsigned = ((d[4].toInt() and 0xFF) shl 12) or
+                ((d[5].toInt() and 0xFF) shl 4)  or
+                ((d[9].toInt() and 0xF0) ushr 4)   // Y[3:0] in bits 7:4 of reg 0x07
+
+        val zUnsigned = ((d[6].toInt() and 0xFF) shl 12) or
+                ((d[7].toInt() and 0xFF) shl 4)  or
+                ((d[10].toInt() and 0xF0) ushr 4)  // Z[3:0] in bits 7:4 of reg 0x08
+
+        // Convert unsigned centered-at-524288 to signed
+        val rawX = (xUnsigned - 524288).toFloat()
+        val rawY = (yUnsigned - 524288).toFloat()
+        // rawZ available if needed for tilt compensation later
+
+        // Feed calibration min/max if active
         if (shaftCalActive) {
             if (rawX < shaftMinX) shaftMinX = rawX
             if (rawX > shaftMaxX) shaftMaxX = rawX
@@ -472,10 +493,10 @@ class GpsManager(private val context: Context) {
             shaftCalSamples++
         }
 
-        // Apply hard-iron offset and compute angle
+        // Apply hard-iron offset and compute shaft angle
         val cx = rawX - shaftHardIronX
         val cy = rawY - shaftHardIronY
-        lastShaftAngleDeg = (Math.toDegrees(Math.atan2(cy.toDouble(), cx.toDouble()))).toFloat()
+        lastShaftAngleDeg = Math.toDegrees(Math.atan2(cy.toDouble(), cx.toDouble())).toFloat()
 
         // Push update so UI refreshes with new shaft angle
         currentData = currentData.copy(shaftAngleDeg = lastShaftAngleDeg)
