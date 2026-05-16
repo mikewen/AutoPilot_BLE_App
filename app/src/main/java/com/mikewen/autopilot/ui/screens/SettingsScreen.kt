@@ -10,6 +10,16 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.*
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.*
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.platform.LocalFocusManager
 import com.mikewen.autopilot.ui.theme.*
 import com.mikewen.autopilot.viewmodel.AutopilotViewModel
 
@@ -159,10 +169,9 @@ fun SettingsScreen(
                         Text("Steer scale", style = MaterialTheme.typography.labelLarge, color = TealAccent)
                         Text(
                             "runtimeMs = steerScaleMs \u00d7 abs(step). " +
-                                    "L1/R1 buttons → 1 step, L5/R5 → 5 steps. " +
+                                    "L1/R1 buttons \u2192 1 step, L5/R5 \u2192 5 steps. " +
                                     "Tune so 1 step moves the rudder ~1\u00b0.",
-                            style = MaterialTheme.typography.bodyMedium, color = Muted
-                        )
+                            style = MaterialTheme.typography.bodyMedium, color = Muted)
                     }
                 }
                 Spacer(Modifier.height(4.dp))
@@ -276,18 +285,100 @@ internal fun ParamSlider(
     unit: String, description: String,
     onValueChange: (Float) -> Unit
 ) {
+    var editing       by remember { mutableStateOf(false) }
+    var hadFocus      by remember { mutableStateOf(false) }
+    var textValue     by remember(value, editing) {
+        mutableStateOf(TextFieldValue(
+            text      = if (unit == " ms") value.toInt().toString()
+            else String.format("%.2f", value),
+            selection = if (editing) TextRange(0, 99) else TextRange.Zero
+        ))
+    }
+    val focusRequester = remember { FocusRequester() }
+    val focusManager   = LocalFocusManager.current
+
+    fun commitText() {
+        if (!editing) return
+        val cleanText = textValue.text.replace(',', '.').trim()
+        val parsed = cleanText.toFloatOrNull()
+        if (parsed != null) {
+            onValueChange(parsed.coerceIn(range.start, range.endInclusive))
+        }
+        editing = false
+        focusManager.clearFocus()
+    }
+
     Column {
-        Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.Bottom) {
-            Column {
+        Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween, Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
                 Text(label, style = MaterialTheme.typography.bodyMedium, color = Color.White)
                 Text(description, style = MaterialTheme.typography.labelMedium, color = Muted)
             }
-            Text("${String.format("%.2f", value)}$unit",
-                style = MaterialTheme.typography.titleMedium, color = TealAccent)
+            Spacer(Modifier.width(8.dp))
+            if (editing) {
+                // Inline text field — appears in place of the value label
+                OutlinedTextField(
+                    value           = textValue,
+                    onValueChange   = { textValue = it },
+                    modifier        = Modifier
+                        .width(110.dp)
+                        .focusRequester(focusRequester)
+                        .onFocusChanged {
+                            if (it.isFocused) hadFocus = true
+                            if (hadFocus && !it.isFocused) commitText()
+                        },
+                    singleLine      = true,
+                    suffix          = { Text(unit, color = Muted) },
+                    textStyle       = MaterialTheme.typography.titleMedium
+                        .copy(color = TealAccent),
+                    keyboardOptions = KeyboardOptions(
+                        keyboardType = KeyboardType.Decimal,
+                        imeAction    = ImeAction.Done
+                    ),
+                    keyboardActions = KeyboardActions(onDone = { commitText() }),
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor   = TealAccent,
+                        unfocusedBorderColor = NavyLight,
+                        cursorColor          = TealAccent
+                    ),
+                    shape = RoundedCornerShape(8.dp)
+                )
+                LaunchedEffect(Unit) { focusRequester.requestFocus() }
+            } else {
+                // Tappable value chip — tap to edit
+                Surface(
+                    onClick = { editing = true; hadFocus = false },
+                    color   = NavyMid,
+                    shape   = RoundedCornerShape(8.dp),
+                    border  = BorderStroke(1.dp, TealAccent.copy(0.4f))
+                ) {
+                    Row(
+                        Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(3.dp)
+                    ) {
+                        Text(
+                            if (unit == " ms") value.toInt().toString()
+                            else String.format("%.2f", value),
+                            style = MaterialTheme.typography.titleMedium, color = TealAccent
+                        )
+                        Text(unit, style = MaterialTheme.typography.labelMedium, color = Muted)
+                        Icon(Icons.Default.Edit, null,
+                            modifier = Modifier.size(12.dp), tint = Muted)
+                    }
+                }
+            }
         }
-        Slider(value = value, onValueChange = onValueChange, valueRange = range,
-            colors = SliderDefaults.colors(thumbColor = TealAccent,
-                activeTrackColor = TealAccent, inactiveTrackColor = NavyLight))
+        Slider(
+            value         = value,
+            onValueChange = onValueChange,
+            valueRange    = range,
+            colors        = SliderDefaults.colors(
+                thumbColor         = TealAccent,
+                activeTrackColor   = TealAccent,
+                inactiveTrackColor = NavyLight
+            )
+        )
     }
 }
 
