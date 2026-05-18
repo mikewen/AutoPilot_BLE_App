@@ -528,7 +528,7 @@ fun CalibrationScreen(
                     "GPS_Steer device must be connected (A5 packets flowing)",
                     "Use L5/L1/R1/R5 buttons below to drive the shaft",
                     "Then tap START and drive full port → full stbd → centre",
-                    "Tap FINISH — needs ≥ 20 samples"
+                    "Tap FINISH — need ≥ 36 samples (72+ ideal = every ~5°)"
                 ))
                 Spacer(Modifier.height(8.dp))
 
@@ -647,10 +647,31 @@ fun CalibrationScreen(
                                 modifier = Modifier.size(36.dp).rotate(rotation))
                             Spacer(Modifier.height(6.dp))
                             Text("Sweeping… $shaftSamples samples",
-                                style = MaterialTheme.typography.titleMedium, color = AmberWarn)
-                            Text("Move rudder full port → full stbd → centre",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = when {
+                                    shaftSamples < 36 -> AmberWarn
+                                    shaftSamples < 72 -> TealAccent
+                                    else              -> GreenGo
+                                })
+                            Text(
+                                when {
+                                    shaftSamples < 36 -> "Keep sweeping — need ≥ 36 samples (${36 - shaftSamples} more)"
+                                    shaftSamples < 72 -> "Good — ${shaftSamples}/72 ideal. Keep going for better accuracy."
+                                    else              -> "✓ Excellent coverage — tap FINISH"
+                                },
                                 style = MaterialTheme.typography.bodyMedium, color = Muted,
                                 textAlign = TextAlign.Center)
+                            Spacer(Modifier.height(6.dp))
+                            LinearProgressIndicator(
+                                progress = { (shaftSamples / 72f).coerceIn(0f, 1f) },
+                                modifier  = Modifier.fillMaxWidth(),
+                                color     = when {
+                                    shaftSamples < 36 -> AmberWarn
+                                    shaftSamples < 72 -> TealAccent
+                                    else              -> GreenGo
+                                },
+                                trackColor = NavyMid
+                            )
                         }
                         Spacer(Modifier.height(8.dp))
                         Button(

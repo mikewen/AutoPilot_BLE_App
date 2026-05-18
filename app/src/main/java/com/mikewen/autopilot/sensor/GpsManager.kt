@@ -118,39 +118,118 @@ class GpsManager(private val context: Context) {
     }
 
     // ── Shaft / rudder position sensor (MMC5603 A5 packet) ──────────────────────
-    // Hard-iron offsets for the shaft MMC5603 — separate from the heading MMC5603
-    // Calibration: sweep the rudder full travel, record min/max X/Y
+    //
+    // Hard-iron calibration using least-squares ellipse fit.
+    //
+    // WHY LEAST-SQUARES:
+    //   The bounding-box (min/max) method assumes the ellipse axes are aligned
+    //   with the sensor axes.  In practice the sensor is never perfectly mounted,
+    //   so the ellipse is tilted and the bounding-box centre is wrong by several
+    //   degrees.  The least-squares method fits the general conic
+    //     A·x² + B·x·y + C·y² + D·x + E·y = 1
+    //   to the raw (X,Y) cloud and extracts the true ellipse centre analytically:
+    //     cx = (B·E − 2·C·D) / (4·A·C − B²)
+    //     cy = (B·D − 2·A·E) / (4·A·C − B²)
+    //   This is correct regardless of sensor orientation.
+    //
+    // SAMPLE COUNT:
+    //   More samples help only if they fill gaps in the arc.
+    //   Once you have ≥ 1 sample every ~5° (72 samples for 360°) adding more
+    //   has no further benefit.  Minimum is 36 (every ~10°).
+    //   At 20 Hz a slow full sweep (~18 s) gives ~360 samples — more than enough.
 
-    // Calibration capture state
-    private var shaftCalActive = false
-    private var shaftMinX = Float.MAX_VALUE; private var shaftMaxX = Float.MIN_VALUE
-    private var shaftMinY = Float.MAX_VALUE; private var shaftMaxY = Float.MIN_VALUE
-    private var shaftCalSamples = 0
-
-    // Most recent shaft angle
+    private val shaftCalPoints  = mutableListOf<Pair<Float, Float>>()
+    private var shaftCalActive  = false
     private var lastShaftAngleDeg: Float? = null
 
     fun startShaftCal() {
         shaftCalActive = true
-        shaftMinX = Float.MAX_VALUE; shaftMaxX = Float.MIN_VALUE
-        shaftMinY = Float.MAX_VALUE; shaftMaxY = Float.MIN_VALUE
-        shaftCalSamples = 0
-        Log.i(TAG, "Shaft cal started")
+        shaftCalPoints.clear()
+        Log.i(TAG, "Shaft cal started — least-squares ellipse fit")
     }
 
+    /**
+     * Finish calibration and compute hard-iron offset via least-squares ellipse fit.
+     * Falls back to bounding-box centre if the linear system is degenerate.
+     * Minimum 36 samples required.
+     */
     fun finishShaftCal(): Boolean {
         shaftCalActive = false
-        if (shaftCalSamples < 20) return false
-        shaftHardIronX = (shaftMinX + shaftMaxX) / 2f
-        shaftHardIronY = (shaftMinY + shaftMaxY) / 2f
-        Log.i(TAG, "Shaft cal: offsetX=%.1f offsetY=%.1f samples=$shaftCalSamples"
-            .format(shaftHardIronX, shaftHardIronY))
+        val n = shaftCalPoints.size
+        if (n < 36) {
+            Log.w(TAG, "Shaft cal: only $n samples — need ≥ 36")
+            return false
+        }
+
+        // Build 5×5 normal matrix MᵀM and RHS vector Mᵀ1
+        // Each row of M: [x², x·y, y², x, y]
+        val mtm = Array(5) { DoubleArray(5) }
+        val mtr = DoubleArray(5)
+        for ((xf, yf) in shaftCalPoints) {
+            val x = xf.toDouble(); val y = yf.toDouble()
+            val row = doubleArrayOf(x*x, x*y, y*y, x, y)
+            for (i in 0..4) {
+                mtr[i] += row[i]
+                for (j in 0..4) mtm[i][j] += row[i] * row[j]
+            }
+        }
+
+        val p = solveLinear5(mtm, mtr) ?: run {
+            // Degenerate — fall back to bounding-box
+            Log.w(TAG, "Shaft cal: singular matrix — bounding-box fallback")
+            val xs = shaftCalPoints.map { it.first }
+            val ys = shaftCalPoints.map { it.second }
+            shaftHardIronX = (xs.min() + xs.max()) / 2f
+            shaftHardIronY = (ys.min() + ys.max()) / 2f
+            Log.i(TAG, "Shaft cal fallback: X=%.1f Y=%.1f n=$n"
+                .format(shaftHardIronX, shaftHardIronY))
+            return true
+        }
+
+        val a = p[0]; val b = p[1]; val cc = p[2]; val d = p[3]; val e = p[4]
+        val denom = 4.0 * a * cc - b * b
+        if (kotlin.math.abs(denom) < 1e-10) {
+            Log.w(TAG, "Shaft cal: degenerate ellipse (denom=$denom)")
+            return false
+        }
+        shaftHardIronX = ((b * e - 2.0 * cc * d) / denom).toFloat()
+        shaftHardIronY = ((b * d - 2.0 * a  * e) / denom).toFloat()
+
+        Log.i(TAG, "Shaft cal LS: X=%.1f Y=%.1f n=$n A=%.4f B=%.4f C=%.4f"
+            .format(shaftHardIronX, shaftHardIronY, a, b, cc))
         return true
     }
 
-    val isShaftCalActive get() = shaftCalActive
-    val shaftCalSampleCount get() = shaftCalSamples
-    fun getShaftHardIron() = Pair(shaftHardIronX, shaftHardIronY)
+    /**
+     * Solve 5×5 linear system Ax=b via Gaussian elimination with partial pivoting.
+     * Returns null if the matrix is singular.
+     */
+    private fun solveLinear5(a: Array<DoubleArray>, b: DoubleArray): DoubleArray? {
+        val n = 5
+        val m = Array(n) { i -> DoubleArray(n + 1) { j -> if (j < n) a[i][j] else b[i] } }
+        for (col in 0 until n) {
+            var maxRow = col
+            for (row in col+1 until n)
+                if (kotlin.math.abs(m[row][col]) > kotlin.math.abs(m[maxRow][col])) maxRow = row
+            val tmp = m[col]; m[col] = m[maxRow]; m[maxRow] = tmp
+            if (kotlin.math.abs(m[col][col]) < 1e-12) return null
+            for (row in col+1 until n) {
+                val f = m[row][col] / m[col][col]
+                for (k in col..n) m[row][k] -= f * m[col][k]
+            }
+        }
+        val x = DoubleArray(n)
+        for (i in n-1 downTo 0) {
+            x[i] = m[i][n]
+            for (j in i+1 until n) x[i] -= m[i][j] * x[j]
+            x[i] /= m[i][i]
+        }
+        return x
+    }
+
+    val isShaftCalActive    get() = shaftCalActive
+    val shaftCalSampleCount get() = shaftCalPoints.size
+    fun getShaftHardIron()   = Pair(shaftHardIronX, shaftHardIronY)
 
     /** Persist current calibration values to SharedPreferences. */
     fun saveCalibration() {
@@ -484,13 +563,9 @@ class GpsManager(private val context: Context) {
         val rawY = (yUnsigned - 524288).toFloat()
         // rawZ available if needed for tilt compensation later
 
-        // Feed calibration min/max if active
+        // Collect raw sample for least-squares fit
         if (shaftCalActive) {
-            if (rawX < shaftMinX) shaftMinX = rawX
-            if (rawX > shaftMaxX) shaftMaxX = rawX
-            if (rawY < shaftMinY) shaftMinY = rawY
-            if (rawY > shaftMaxY) shaftMaxY = rawY
-            shaftCalSamples++
+            shaftCalPoints.add(Pair(rawX, rawY))
         }
 
         // Apply hard-iron offset and compute shaft angle
