@@ -4,6 +4,7 @@ import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.*
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -22,6 +23,7 @@ import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.platform.LocalFocusManager
 import com.mikewen.autopilot.ui.theme.*
 import com.mikewen.autopilot.viewmodel.AutopilotViewModel
+import java.util.Locale
 
 @Composable
 fun SettingsScreen(
@@ -51,7 +53,7 @@ fun SettingsScreen(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 IconButton(onClick = onBack) {
-                    Icon(Icons.Default.ArrowBack, "Back", tint = TealAccent)
+                    Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back", tint = TealAccent)
                 }
                 Column(Modifier.weight(1f)) {
                     Text("SETTINGS", style = MaterialTheme.typography.titleLarge, color = Color.White)
@@ -116,9 +118,9 @@ fun SettingsScreen(
             SectionCard(title = "DEADBAND & ALARMS") {
                 DeadbandExplainer()
                 Spacer(Modifier.height(4.dp))
-                ParamSlider("Deadband width", pid.deadbandDeg, 0f..15f, "°",
+                ParamSlider("Deadband width", pid.deadbandDeg, 1f..9f, "°",
                     "Error must exceed ±this before PID activates", vm::updateDeadband)
-                ParamSlider("Off-course alarm", pid.offCourseAlarmDeg, 5f..45f, "°",
+                ParamSlider("Off-course alarm", pid.offCourseAlarmDeg, 5f..30f, "°",
                     "Alarm triggers when error exceeds this threshold", vm::updateOffCourseAlarm)
             }
 
@@ -136,7 +138,7 @@ fun SettingsScreen(
             SectionCard(title = "OUTPUT LIMITS") {
                 ParamSlider("Output limit", pid.outputLimitDeg, 5f..60f, "°",
                     "Maximum rudder angle / throttle differential", vm::updateOutputLimit)
-                ParamSlider("Rate limit", pid.rateLimitDegPerSec, 0f..180f, "°/s",
+                ParamSlider("Rate limit", pid.rateLimitDegPerSec, 10f..90f, "°/s",
                     "Max change in output per second — 0 = disabled", vm::updateRateLimit)
             }
 
@@ -170,9 +172,9 @@ fun SettingsScreen(
                                     val t = (spd / speedKt).coerceIn(0f, 1f)
                                     val scale = 1f - t * (1f - minScale)
                                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                        Text("${"%.0f".format(spd)}kt",
+                                        Text("${"%.0f".format(Locale.US, spd)}kt",
                                             style = MaterialTheme.typography.labelMedium, color = Muted)
-                                        Text("${"%.0f".format(scale * 100)}%",
+                                        Text("${"%.0f".format(Locale.US, scale * 100)}%",
                                             style = MaterialTheme.typography.labelLarge,
                                             color = if (scale > 0.7f) TealAccent else AmberWarn)
                                     }
@@ -193,19 +195,18 @@ fun SettingsScreen(
                     Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         Text("Steer scale", style = MaterialTheme.typography.labelLarge, color = TealAccent)
                         Text(
-                            "runtimeMs = steerScaleMs \u00d7 abs(step). " +
-                                    "L1/R1 buttons → 1 step, L5/R5 → 5 steps. " +
+                            "runtimeMs = steerScaleMs * abs(step). " +
+                                    "L1/R1 buttons -> 1 step, L5/R5 -> 5 steps. " +
                                     "Tune so 1 step moves the rudder ~1\u00b0.",
                             style = MaterialTheme.typography.bodyMedium, color = Muted
                         )
                     }
                 }
                 Spacer(Modifier.height(4.dp))
-                // Integer slider 50..2000 ms — use float internally, cast to Int
                 ParamSlider(
                     label       = "Steer scale",
                     value       = pid.steerScaleMs.toFloat(),
-                    range       = 50f..2000f,
+                    range       = 20f..500f,
                     unit        = " ms",
                     description = "Motor run time per step unit (L1/R1 = 1 step, L5/R5 = 5 steps)",
                     onValueChange = { vm.updateSteerScale(it.toInt()) }
@@ -233,7 +234,7 @@ fun SettingsScreen(
                 colors   = ButtonDefaults.buttonColors(containerColor = TealAccent, contentColor = NavyDeep),
                 shape    = RoundedCornerShape(10.dp)
             ) {
-                Icon(Icons.Default.Send, null, Modifier.size(18.dp))
+                Icon(Icons.AutoMirrored.Filled.Send, null, Modifier.size(18.dp))
                 Spacer(Modifier.width(8.dp))
                 Text("APPLY ALL SETTINGS", style = MaterialTheme.typography.labelLarge)
             }
@@ -283,7 +284,7 @@ private fun DeadbandExplainer() {
             Text(
                 "When the heading error is smaller than the deadband, the PID output is forced to zero " +
                         "and the integral is reset. This prevents the motor from hunting (constantly correcting " +
-                        "tiny errors caused by waves). Typical values: 1°–5°.",
+                        "tiny errors caused by waves). Typical values: 1\u00b0\u20135\u00b0.",
                 style = MaterialTheme.typography.bodyMedium, color = Muted
             )
         }
@@ -311,24 +312,39 @@ internal fun ParamSlider(
     unit: String, description: String,
     onValueChange: (Float) -> Unit
 ) {
-    var editing       by remember { mutableStateOf(false) }
-    var textValue     by remember(value) {
+    var editing by remember { mutableStateOf(false) }
+    
+    // textValue stores the current string while editing
+    var textValue by remember {
         mutableStateOf(TextFieldValue(
-            text      = if (unit == " ms") value.toInt().toString()
-            else String.format("%.2f", value),
-            selection = TextRange(0, 99)   // select all on open
+            if (unit == " ms") value.toInt().toString()
+            else String.format(Locale.US, "%.2f", value)
         ))
     }
+
+    // Update textValue from external 'value' ONLY when NOT currently editing
+    LaunchedEffect(value) {
+        if (!editing) {
+            textValue = TextFieldValue(
+                text = if (unit == " ms") value.toInt().toString()
+                else String.format(Locale.US, "%.2f", value)
+            )
+        }
+    }
+
     val focusRequester = remember { FocusRequester() }
     val focusManager   = LocalFocusManager.current
+    var hasFocused     by remember { mutableStateOf(false) }
 
     fun commitText() {
-        val parsed = textValue.text.trim().toFloatOrNull()
+        if (!editing) return
+        val sanitized = textValue.text.trim().replace(',', '.')
+        val parsed = sanitized.toFloatOrNull()
         if (parsed != null) {
             onValueChange(parsed.coerceIn(range.start, range.endInclusive))
         }
         editing = false
-        focusManager.clearFocus()
+        hasFocused = false
     }
 
     Column {
@@ -339,33 +355,45 @@ internal fun ParamSlider(
             }
             Spacer(Modifier.width(8.dp))
             if (editing) {
-                // Inline text field — appears in place of the value label
                 OutlinedTextField(
                     value           = textValue,
                     onValueChange   = { textValue = it },
                     modifier        = Modifier
                         .width(110.dp)
                         .focusRequester(focusRequester)
-                        .onFocusChanged { if (!it.isFocused) editing = false },
+                        .onFocusChanged {
+                            if (it.isFocused) {
+                                hasFocused = true
+                            } else if (hasFocused) {
+                                // Focus lost (e.g. user tapped elsewhere) -> commit and close
+                                commitText()
+                            }
+                        },
                     singleLine      = true,
                     suffix          = { Text(unit, color = Muted) },
-                    textStyle       = MaterialTheme.typography.titleMedium
-                        .copy(color = TealAccent),
+                    textStyle       = MaterialTheme.typography.titleMedium.copy(color = TealAccent),
                     keyboardOptions = KeyboardOptions(
                         keyboardType = KeyboardType.Decimal,
                         imeAction    = ImeAction.Done
                     ),
-                    keyboardActions = KeyboardActions(onDone = { commitText() }),
+                    keyboardActions = KeyboardActions(onDone = { 
+                        // Clear focus triggers onFocusChanged -> commitText()
+                        focusManager.clearFocus() 
+                    }),
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedBorderColor   = TealAccent,
                         unfocusedBorderColor = NavyLight,
-                        cursorColor          = TealAccent
+                        cursorColor          = TealAccent,
+                        focusedTextColor     = TealAccent
                     ),
                     shape = RoundedCornerShape(8.dp)
                 )
-                LaunchedEffect(Unit) { focusRequester.requestFocus() }
+                LaunchedEffect(Unit) {
+                    // Select all text on open for easy replacement
+                    textValue = textValue.copy(selection = TextRange(0, textValue.text.length))
+                    focusRequester.requestFocus()
+                }
             } else {
-                // Tappable value chip — tap to edit
                 Surface(
                     onClick = { editing = true },
                     color   = NavyMid,
@@ -379,12 +407,11 @@ internal fun ParamSlider(
                     ) {
                         Text(
                             if (unit == " ms") value.toInt().toString()
-                            else String.format("%.2f", value),
+                            else String.format(Locale.US, "%.2f", value),
                             style = MaterialTheme.typography.titleMedium, color = TealAccent
                         )
                         Text(unit, style = MaterialTheme.typography.labelMedium, color = Muted)
-                        Icon(Icons.Default.Edit, null,
-                            modifier = Modifier.size(12.dp), tint = Muted)
+                        Icon(Icons.Default.Edit, null, modifier = Modifier.size(12.dp), tint = Muted)
                     }
                 }
             }

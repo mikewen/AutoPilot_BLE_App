@@ -84,6 +84,10 @@ fun CalibrationScreen(
     // ── Shaft sensor display state ────────────────────────────────────────────
     var shaftRawX by remember { mutableFloatStateOf(0f) }
     var shaftRawY by remember { mutableFloatStateOf(0f) }
+    var shaftPhase   by remember { mutableStateOf(ShaftCalPhase.IDLE) }
+    var shaftSamples by remember { mutableIntStateOf(0) }
+    var shaftResult  by remember { mutableStateOf("") }
+    var shaftOk      by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         while (true) {
@@ -98,6 +102,8 @@ fun CalibrationScreen(
             rawMz = fusion.lastRawMz.toInt()
             gyroZDegS  = fusion.lastGyroZDegS
             shaftRawX = vm.gpsManager.lastShaftRawX
+            if (vm.gpsManager.isShaftCalActive)
+                shaftSamples = vm.gpsManager.shaftCalSampleCount
             shaftRawY = vm.gpsManager.lastShaftRawY
             val now    = System.currentTimeMillis()
             val dtS    = ((now - gyroLastTimeMs) / 1000f).coerceIn(0f, 0.2f)
@@ -517,23 +523,17 @@ fun CalibrationScreen(
                 }
             }
 
-            // ── Shaft / Rudder Position Calibration — 3-point LUT ─────────────
+            // ── Shaft / Rudder Position Calibration ────────────────────────────
+            // QMC6308 (8-byte): least-squares ellipse fit — sweep full travel
+            // MMC5603 (11-byte): 3-point LUT — set zero/port/stbd manually
             SectionCard("SHAFT / RUDDER POSITION  (GPS_Steer A5)") {
+                val isQmc    = vm.gpsManager.isQmc6308
+                val lutValid = vm.gpsManager.isShaftLutValid
+                val shaftAngle = gpsData.shaftAngleDeg
+                val pid      = vm.pidConfig.collectAsState().value
                 val (lutZero, lutPort, lutStbd) = vm.gpsManager.getLutPoints()
-                val (portMaxDeg, stbdMaxDeg)   = vm.gpsManager.getLutMaxDeg()
-                val lutValid    = vm.gpsManager.isShaftLutValid
-                val shaftAngle  = gpsData.shaftAngleDeg
-                val pid         = vm.pidConfig.collectAsState().value
 
-                InstructionBox("⚙", "Set 3 reference positions", listOf(
-                    "Use L5/L1/R1/R5 below to drive the shaft",
-                    "Centre rudder → tap SET ZERO",
-                    "Drive to full port limit → tap SET PORT",
-                    "Drive to full stbd limit → tap SET STBD"
-                ))
-                Spacer(Modifier.height(8.dp))
-
-                // ── Motor control buttons ─────────────────────────────────────
+                // ── Motor control ─────────────────────────────────────────────
                 Text("STEER MOTOR  (scale: ${pid.steerScaleMs} ms/step)",
                     style = MaterialTheme.typography.labelLarge, color = Muted)
                 Spacer(Modifier.height(6.dp))
@@ -548,94 +548,160 @@ fun CalibrationScreen(
                                     border = BorderStroke(1.dp, RedAlarm.copy(0.6f)),
                                     colors = ButtonDefaults.outlinedButtonColors(contentColor = RedAlarm),
                                     contentPadding = PaddingValues(0.dp)
-                                ) { Text(label, style = MaterialTheme.typography.labelLarge,
-                                    fontWeight = FontWeight.Bold) }
+                                ) { Text(label, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold) }
                             } else {
                                 Button(
                                     onClick = { vm.sendRudderStep(step) },
                                     modifier = Modifier.weight(1f).height(52.dp),
                                     shape = RoundedCornerShape(8.dp),
-                                    colors = ButtonDefaults.buttonColors(
-                                        containerColor = NavyMid, contentColor = TealAccent),
+                                    colors = ButtonDefaults.buttonColors(containerColor = NavyMid, contentColor = TealAccent),
                                     contentPadding = PaddingValues(0.dp)
-                                ) { Text(label, style = MaterialTheme.typography.titleMedium,
-                                    fontWeight = FontWeight.Bold) }
+                                ) { Text(label, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold) }
                             }
                         }
                 }
                 Spacer(Modifier.height(12.dp))
 
                 // ── Live sensor display ───────────────────────────────────────
-                Surface(color = NavyMid, shape = RoundedCornerShape(8.dp),
-                    modifier = Modifier.fillMaxWidth()) {
-                    Row(Modifier.padding(12.dp).fillMaxWidth(),
-                        Arrangement.SpaceEvenly, Alignment.CenterVertically) {
+                Surface(color = NavyMid, shape = RoundedCornerShape(8.dp), modifier = Modifier.fillMaxWidth()) {
+                    Row(Modifier.padding(12.dp).fillMaxWidth(), Arrangement.SpaceEvenly, Alignment.CenterVertically) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
                             Text("SHAFT ANGLE", style = MaterialTheme.typography.labelMedium, color = Muted)
-                            Text(
-                                if (shaftAngle != null) "${"%.1f".format(shaftAngle)}°" else "—",
+                            Text(if (shaftAngle != null) "${"%.1f".format(shaftAngle)}\u00b0" else "\u2014",
                                 fontSize = 28.sp, fontWeight = FontWeight.Bold,
                                 fontFamily = FontFamily.Monospace,
-                                color = if (shaftAngle != null) TealAccent else Muted
-                            )
+                                color = if (shaftAngle != null) TealAccent else Muted)
                         }
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
                             Text("RAW X", style = MaterialTheme.typography.labelMedium, color = Muted)
-                            Text("%6d".format(shaftRawX.toInt()),
-                                fontSize = 18.sp, fontFamily = FontFamily.Monospace,
-                                color = TealAccent, fontWeight = FontWeight.Bold)
+                            Text("%6d".format(shaftRawX.toInt()), fontSize = 18.sp,
+                                fontFamily = FontFamily.Monospace, color = TealAccent, fontWeight = FontWeight.Bold)
                         }
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
                             Text("RAW Y", style = MaterialTheme.typography.labelMedium, color = Muted)
-                            Text("%6d".format(shaftRawY.toInt()),
-                                fontSize = 18.sp, fontFamily = FontFamily.Monospace,
-                                color = TealAccent, fontWeight = FontWeight.Bold)
+                            Text("%6d".format(shaftRawY.toInt()), fontSize = 18.sp,
+                                fontFamily = FontFamily.Monospace, color = TealAccent, fontWeight = FontWeight.Bold)
                         }
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
                             Text("SENSOR", style = MaterialTheme.typography.labelMedium, color = Muted)
-                            Text(
-                                when {
-                                    kotlin.math.abs(shaftRawX) > 50000 -> "MMC5603"
-                                    shaftRawX != 0f                    -> "QMC6308"
-                                    else                               -> "—"
-                                },
+                            Text(if (isQmc) "QMC6308" else if (shaftRawX != 0f) "MMC5603" else "\u2014",
                                 style = MaterialTheme.typography.titleMedium,
-                                color = if (shaftRawX != 0f) GreenGo else Muted
-                            )
+                                color = if (shaftRawX != 0f) GreenGo else Muted)
                         }
                     }
                 }
                 Spacer(Modifier.height(12.dp))
 
-                // ── 3-point LUT set buttons ───────────────────────────────────
-                Text("CALIBRATION POINTS", style = MaterialTheme.typography.labelLarge, color = Muted)
-                Spacer(Modifier.height(6.dp))
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    // SET PORT
-                    LutSetButton(
-                        label    = "SET PORT",
-                        isSet    = lutPort.first != 0f || lutPort.second != 0f,
-                        rawX     = lutPort.first, rawY = lutPort.second,
-                        modifier = Modifier.weight(1f)
-                    ) { vm.gpsManager.setShaftPort(45f); vm.gpsManager.saveCalibration() }
-                    // SET ZERO
-                    LutSetButton(
-                        label    = "SET ZERO",
-                        isSet    = lutZero.first != 0f || lutZero.second != 0f,
-                        rawX     = lutZero.first, rawY = lutZero.second,
-                        modifier = Modifier.weight(1f)
-                    ) { vm.gpsManager.setShaftZero(); vm.gpsManager.saveCalibration() }
-                    // SET STBD
-                    LutSetButton(
-                        label    = "SET STBD",
-                        isSet    = lutStbd.first != 0f || lutStbd.second != 0f,
-                        rawX     = lutStbd.first, rawY = lutStbd.second,
-                        modifier = Modifier.weight(1f)
-                    ) { vm.gpsManager.setShaftStbd(45f); vm.gpsManager.saveCalibration() }
+                if (isQmc) {
+                    // ── QMC6308: least-squares sweep ──────────────────────────
+                    InstructionBox("\u2699", "QMC6308 \u2014 sweep full port \u2192 stbd", listOf(
+                        "Tap START, drive rudder slowly to full port limit",
+                        "Then full stbd, then back to centre",
+                        "Tap FINISH \u2014 need \u2265 36 samples (72+ ideal)",
+                        "Then set port/stbd reference points below"
+                    ))
+                    Spacer(Modifier.height(8.dp))
+                    when (shaftPhase) {
+                        ShaftCalPhase.IDLE -> {
+                            if (shaftResult.isNotEmpty()) {
+                                ResultChip(success = shaftOk, message = shaftResult)
+                                Spacer(Modifier.height(8.dp))
+                            }
+                            Button(
+                                onClick = { shaftResult = ""; shaftSamples = 0; vm.gpsManager.startShaftCal(); shaftPhase = ShaftCalPhase.SWEEPING },
+                                enabled  = hasA1Source,
+                                modifier = Modifier.fillMaxWidth(),
+                                colors   = ButtonDefaults.buttonColors(containerColor = TealAccent, contentColor = NavyDeep),
+                                shape    = RoundedCornerShape(10.dp)
+                            ) {
+                                Icon(Icons.Default.PlayArrow, null, Modifier.size(18.dp))
+                                Spacer(Modifier.width(8.dp))
+                                Text("START SWEEP CAL", style = MaterialTheme.typography.labelLarge)
+                            }
+                        }
+                        ShaftCalPhase.SWEEPING -> {
+                            Text("Samples: $shaftSamples",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = when { shaftSamples < 36 -> AmberWarn; shaftSamples < 72 -> TealAccent; else -> GreenGo })
+                            LinearProgressIndicator(
+                                progress   = { (shaftSamples / 72f).coerceIn(0f, 1f) },
+                                modifier   = Modifier.fillMaxWidth(),
+                                color      = when { shaftSamples < 36 -> AmberWarn; shaftSamples < 72 -> TealAccent; else -> GreenGo },
+                                trackColor = NavyMid)
+                            Text(when {
+                                shaftSamples < 36 -> "Keep sweeping \u2014 need \u2265 36 (${36 - shaftSamples} more)"
+                                shaftSamples < 72 -> "Good \u2014 keep going for best accuracy"
+                                else              -> "\u2713 Excellent \u2014 tap FINISH"
+                            }, style = MaterialTheme.typography.bodyMedium, color = Muted,
+                                textAlign = TextAlign.Center)
+                            Spacer(Modifier.height(8.dp))
+                            Button(
+                                onClick = {
+                                    val ok = vm.gpsManager.finishShaftCal()
+                                    shaftPhase = ShaftCalPhase.IDLE; shaftOk = ok
+                                    val ctr = vm.gpsManager.getLutPoints().first
+                                    shaftResult = if (ok)
+                                        "Ellipse centre X=%.0f Y=%.0f ($shaftSamples pts)".format(ctr.first, ctr.second)
+                                    else "Not enough samples \u2014 sweep full travel"
+                                    if (ok) vm.gpsManager.saveCalibration()
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                                colors   = ButtonDefaults.buttonColors(containerColor = GreenGo, contentColor = NavyDeep),
+                                shape    = RoundedCornerShape(10.dp)
+                            ) {
+                                Icon(Icons.Default.Stop, null, Modifier.size(18.dp))
+                                Spacer(Modifier.width(8.dp))
+                                Text("FINISH \u2014 COMPUTE CENTRE", style = MaterialTheme.typography.labelLarge)
+                            }
+                        }
+                    }
+                    if (lutValid) {
+                        Spacer(Modifier.height(12.dp))
+                        Text("REFERENCE POINTS  (after sweep cal)", style = MaterialTheme.typography.labelLarge, color = Muted)
+                        Text("Drive to port limit \u2192 SET PORT, then stbd \u2192 SET STBD",
+                            style = MaterialTheme.typography.labelMedium, color = Muted)
+                        Spacer(Modifier.height(6.dp))
+                        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            LutSetButton("SET PORT",
+                                isSet = lutPort.first != 0f || lutPort.second != 0f,
+                                rawX = lutPort.first, rawY = lutPort.second,
+                                modifier = Modifier.weight(1f)
+                            ) { vm.gpsManager.setShaftPort(45f); vm.gpsManager.saveCalibration() }
+                            LutSetButton("SET STBD",
+                                isSet = lutStbd.first != 0f || lutStbd.second != 0f,
+                                rawX = lutStbd.first, rawY = lutStbd.second,
+                                modifier = Modifier.weight(1f)
+                            ) { vm.gpsManager.setShaftStbd(45f); vm.gpsManager.saveCalibration() }
+                        }
+                    }
+                } else {
+                    // ── MMC5603: 3-point LUT ──────────────────────────────────
+                    InstructionBox("\u2699", "MMC5603 \u2014 set 3 reference positions", listOf(
+                        "Centre rudder \u2192 tap SET ZERO",
+                        "Drive to full port limit \u2192 tap SET PORT",
+                        "Drive to full stbd limit \u2192 tap SET STBD"
+                    ))
+                    Spacer(Modifier.height(8.dp))
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        LutSetButton("SET ZERO",
+                            isSet = lutZero.first != 0f || lutZero.second != 0f,
+                            rawX = lutZero.first, rawY = lutZero.second,
+                            modifier = Modifier.weight(1f)
+                        ) { vm.gpsManager.setShaftZero(); vm.gpsManager.saveCalibration() }
+                        LutSetButton("SET PORT",
+                            isSet = lutPort.first != 0f || lutPort.second != 0f,
+                            rawX = lutPort.first, rawY = lutPort.second,
+                            modifier = Modifier.weight(1f)
+                        ) { vm.gpsManager.setShaftPort(45f); vm.gpsManager.saveCalibration() }
+                        LutSetButton("SET STBD",
+                            isSet = lutStbd.first != 0f || lutStbd.second != 0f,
+                            rawX = lutStbd.first, rawY = lutStbd.second,
+                            modifier = Modifier.weight(1f)
+                        ) { vm.gpsManager.setShaftStbd(45f); vm.gpsManager.saveCalibration() }
+                    }
                 }
-                Spacer(Modifier.height(8.dp))
 
-                // LUT status
+                Spacer(Modifier.height(8.dp))
                 Surface(
                     color  = if (lutValid) GreenGo.copy(0.12f) else NavyMid,
                     shape  = RoundedCornerShape(8.dp),
@@ -647,13 +713,14 @@ fun CalibrationScreen(
                         verticalAlignment = Alignment.CenterVertically) {
                         Icon(
                             if (lutValid) Icons.Default.CheckCircle else Icons.Default.RadioButtonUnchecked,
-                            null,
-                            tint = if (lutValid) GreenGo else Muted,
-                            modifier = Modifier.size(18.dp)
-                        )
+                            null, tint = if (lutValid) GreenGo else Muted, modifier = Modifier.size(18.dp))
                         Text(
-                            if (lutValid) "LUT calibrated — shaft angle active"
-                            else "Set all 3 points to activate shaft angle",
+                            if (lutValid)
+                                if (isQmc) "LS calibrated \u2014 ellipse centre computed"
+                                else "LUT calibrated \u2014 shaft angle active"
+                            else
+                                if (isQmc) "Run sweep cal then set port/stbd references"
+                                else "Set all 3 LUT points to activate shaft angle",
                             style = MaterialTheme.typography.bodyMedium,
                             color = if (lutValid) GreenGo else Muted
                         )
@@ -662,6 +729,7 @@ fun CalibrationScreen(
             }
 
             // ── Tips
+
             // ── Tips ──────────────────────────────────────────────────────────
             SectionCard("TIPS") {
                 TipRow("📐", "Verifying gyro scale",
@@ -682,6 +750,7 @@ fun CalibrationScreen(
 
 private enum class GyroPhase  { IDLE, SAMPLING }
 private enum class MagPhase   { IDLE, ROTATING }
+private enum class ShaftCalPhase { IDLE, SWEEPING }
 
 // ── Raw value cell — large monospace number ───────────────────────────────────
 

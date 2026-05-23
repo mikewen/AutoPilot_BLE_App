@@ -146,9 +146,11 @@ class GpsManager(private val context: Context) {
     //   sign determines port (−) or stbd (+) side.
     //   output = arcAngle / refArcAngle * maxDeg
 
-    private val shaftCalPoints   = mutableListOf<Pair<Float, Float>>()   // kept for future use
+    private val shaftCalPoints   = mutableListOf<Pair<Float, Float>>()
     private var shaftCalActive   = false
     private var lastShaftAngleDeg: Float? = null
+    private var lastA5PacketSize  = 0   // 8=QMC6308, 11=MMC5603
+    val isQmc6308 get() = lastA5PacketSize == 8
     var lastShaftRawX: Float = 0f
         private set
     var lastShaftRawY: Float = 0f
@@ -200,7 +202,87 @@ class GpsManager(private val context: Context) {
 
     // Kept for compatibility with CalibrationScreen sweep flow (no-op now)
     fun startShaftCal() { shaftCalActive = true;  shaftCalPoints.clear() }
-    fun finishShaftCal(): Boolean { shaftCalActive = false; return shaftLutValid }
+    /**
+     * Finish shaft calibration.
+     * QMC6308 (8-byte): uses least-squares ellipse fit — accurate for ±45° arc.
+     * MMC5603 (11-byte): uses 3-point LUT (set via setShaftZero/Port/Stbd).
+     */
+    fun finishShaftCal(): Boolean {
+        shaftCalActive = false
+        return if (lastA5PacketSize == 8) finishShaftCalLS()
+        else shaftLutValid
+    }
+
+    /**
+     * Least-squares ellipse fit for QMC6308 shaft sensor.
+     * Fits A·x²+B·x·y+C·y²+D·x+E·y=1 to the raw (X,Y) point cloud.
+     * Centre: cx=(B·E−2·C·D)/(4·A·C−B²), cy=(B·D−2·A·E)/(4·A·C−B²).
+     * Minimum 36 samples; at 20 Hz a slow ±45° sweep gives ~180 samples.
+     */
+    private fun finishShaftCalLS(): Boolean {
+        val n = shaftCalPoints.size
+        if (n < 36) {
+            Log.w(TAG, "Shaft LS cal: only $n samples — need ≥ 36")
+            return false
+        }
+        val mtm = Array(5) { DoubleArray(5) }
+        val mtr = DoubleArray(5)
+        for ((xf, yf) in shaftCalPoints) {
+            val x = xf.toDouble(); val y = yf.toDouble()
+            val row = doubleArrayOf(x*x, x*y, y*y, x, y)
+            for (i in 0..4) {
+                mtr[i] += row[i]
+                for (j in 0..4) mtm[i][j] += row[i] * row[j]
+            }
+        }
+        val p = solveLinear5(mtm, mtr) ?: run {
+            Log.w(TAG, "Shaft LS cal: singular matrix — bounding-box fallback")
+            val xs = shaftCalPoints.map { it.first }
+            val ys = shaftCalPoints.map { it.second }
+            shaftZeroX = (xs.min() + xs.max()) / 2f
+            shaftZeroY = (ys.min() + ys.max()) / 2f
+            shaftLutValid = true
+            Log.i(TAG, "Shaft bbox fallback: X=%.1f Y=%.1f n=$n".format(shaftZeroX, shaftZeroY))
+            return true
+        }
+        val a = p[0]; val b = p[1]; val cc = p[2]; val d = p[3]; val e = p[4]
+        val denom = 4.0 * a * cc - b * b
+        if (kotlin.math.abs(denom) < 1e-10) {
+            Log.w(TAG, "Shaft LS: degenerate ellipse")
+            return false
+        }
+        // Store centre in shaftZeroX/Y — used by computeShaftAngleLut as origin
+        shaftZeroX = ((b * e - 2.0 * cc * d) / denom).toFloat()
+        shaftZeroY = ((b * d - 2.0 * a  * e) / denom).toFloat()
+        shaftLutValid = true
+        Log.i(TAG, "Shaft LS: centre X=%.1f Y=%.1f n=$n A=%.4f B=%.4f C=%.4f"
+            .format(shaftZeroX, shaftZeroY, a, b, cc))
+        return true
+    }
+
+    /** Gaussian elimination with partial pivoting — solves 5×5 system Ax=b. */
+    private fun solveLinear5(a: Array<DoubleArray>, b: DoubleArray): DoubleArray? {
+        val n = 5
+        val m = Array(n) { i -> DoubleArray(n + 1) { j -> if (j < n) a[i][j] else b[i] } }
+        for (col in 0 until n) {
+            var maxRow = col
+            for (row in col+1 until n)
+                if (kotlin.math.abs(m[row][col]) > kotlin.math.abs(m[maxRow][col])) maxRow = row
+            val tmp = m[col]; m[col] = m[maxRow]; m[maxRow] = tmp
+            if (kotlin.math.abs(m[col][col]) < 1e-12) return null
+            for (row in col+1 until n) {
+                val f = m[row][col] / m[col][col]
+                for (k in col..n) m[row][k] -= f * m[col][k]
+            }
+        }
+        val x = DoubleArray(n)
+        for (i in n-1 downTo 0) {
+            x[i] = m[i][n]
+            for (j in i+1 until n) x[i] -= m[i][j] * x[j]
+            x[i] /= m[i][i]
+        }
+        return x
+    }
     val isShaftCalActive    get() = shaftCalActive
     val shaftCalSampleCount get() = shaftCalPoints.size
     fun getShaftHardIron()   = Pair(shaftZeroX, shaftZeroY)  // compat stub
@@ -533,6 +615,58 @@ class GpsManager(private val context: Context) {
      * Side is determined by which fraction falls in [0, 1].
      * This is stable regardless of magnet N/S axis orientation.
      */
+    /**
+     * Compute shaft angle for QMC6308 after least-squares ellipse fit.
+     *
+     * Step 1: subtract ellipse centre (shaftZeroX/Y = LS-computed centre).
+     * Step 2: atan2(cy, cx) gives the raw angle −180°…+180°.
+     * Step 3: if port/stbd reference points are set, subtract the angle at
+     *         neutral (zero position) so the output reads 0° at centre.
+     *         Port = negative, stbd = positive.
+     *
+     * Works correctly for nearly full 360° rotation.
+     */
+    private fun computeShaftAngleQmc(rawX: Float, rawY: Float): Float {
+        // Translate to ellipse-centre coordinates
+        val cx = (rawX - shaftZeroX).toDouble()
+        val cy = (rawY - shaftZeroY).toDouble()
+        val angleDeg = Math.toDegrees(Math.atan2(cy, cx)).toFloat()
+
+        // If the zero-heading reference is set (port or stbd was set, which implies
+        // the user drove to centre first), subtract the angle at the neutral position
+        // so output reads near 0° at the rudder centre.
+        // shaftPortX/Y and shaftStbdX/Y are set after sweep cal via setShaftPort/Stbd.
+        // We use the midpoint of port+stbd vectors as the zero reference.
+        val hasRefs = (shaftPortX != shaftZeroX || shaftPortY != shaftZeroY) &&
+                (shaftStbdX != shaftZeroX || shaftStbdY != shaftZeroY)
+        return if (hasRefs) {
+            val portAngle = Math.toDegrees(Math.atan2(
+                (shaftPortY - shaftZeroY).toDouble(),
+                (shaftPortX - shaftZeroX).toDouble())).toFloat()
+            val stbdAngle = Math.toDegrees(Math.atan2(
+                (shaftStbdY - shaftZeroY).toDouble(),
+                (shaftStbdX - shaftZeroX).toDouble())).toFloat()
+            // Zero reference = midpoint angle between port and stbd
+            var zeroRef = (portAngle + stbdAngle) / 2f
+            // Wrap-safe midpoint when port and stbd straddle ±180°
+            var diff = stbdAngle - portAngle
+            while (diff >  180f) diff -= 360f
+            while (diff < -180f) diff += 360f
+            zeroRef = portAngle + diff / 2f
+
+            var result = angleDeg - zeroRef
+            while (result >  180f) result -= 360f
+            while (result < -180f) result += 360f
+            // Port is negative, stbd is positive — flip if needed based on
+            // which direction port was calibrated
+            val portOffset = portAngle - zeroRef
+            if (portOffset > 0f) -result else result
+        } else {
+            // No zero reference yet — return raw centred angle
+            angleDeg
+        }
+    }
+
     private fun computeShaftAngleLut(rawX: Float, rawY: Float): Float {
         val sx = (rawX - shaftZeroX).toDouble()
         val sy = (rawY - shaftZeroY).toDouble()
@@ -592,6 +726,7 @@ class GpsManager(private val context: Context) {
 
 
     private fun parseA5Shaft(b: ByteArray) {
+        lastA5PacketSize = b.size   // track sensor type for cal dispatch
         val rawX: Float
         val rawY: Float
 
@@ -624,9 +759,18 @@ class GpsManager(private val context: Context) {
             shaftCalPoints.add(Pair(rawX, rawY))
         }
 
-        // Compute shaft angle: LUT when calibrated, raw atan2 otherwise
-        lastShaftAngleDeg = if (shaftLutValid) computeShaftAngleLut(rawX, rawY)
-        else Math.toDegrees(Math.atan2(rawY.toDouble(), rawX.toDouble())).toFloat()
+        // Compute shaft angle
+        lastShaftAngleDeg = when {
+            // QMC6308 with LS-computed centre: atan2 from centre, full 360° capable
+            lastA5PacketSize == 8 && shaftLutValid ->
+                computeShaftAngleQmc(rawX, rawY)
+            // MMC5603 or uncalibrated QMC6308: LUT nearest-segment
+            shaftLutValid ->
+                computeShaftAngleLut(rawX, rawY)
+            // No calibration yet: raw atan2
+            else ->
+                Math.toDegrees(Math.atan2(rawY.toDouble(), rawX.toDouble())).toFloat()
+        }
 
         // Push update so UI refreshes
         currentData = currentData.copy(shaftAngleDeg = lastShaftAngleDeg)
