@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import com.mikewen.autopilot.ble.BleManager
 import com.mikewen.autopilot.ble.ImuManager
 import com.mikewen.autopilot.model.*
+import kotlinx.coroutines.flow.first
 import com.mikewen.autopilot.data.SettingsRepository
 import com.mikewen.autopilot.ble.RemoteManager
 import com.mikewen.autopilot.sensor.GpsManager
@@ -28,6 +29,21 @@ class AutopilotViewModel(application: Application) : AndroidViewModel(applicatio
     val selectedType: StateFlow<AutopilotType?> = _selectedType.asStateFlow()
 
     fun selectAutopilotType(type: AutopilotType) { _selectedType.value = type }
+
+    // ── Boat Profile ──────────────────────────────────────────────────────────
+    private val _activeProfile = MutableStateFlow(BoatProfile.CL16)
+    val activeProfile: StateFlow<BoatProfile> = _activeProfile.asStateFlow()
+
+    fun selectProfile(profile: BoatProfile) {
+        _activeProfile.value = profile
+        viewModelScope.launch {
+            settingsRepo.saveActiveProfile(profile)
+            // Load this profile's PidConfig
+            val config = settingsRepo.pidConfigFlow(profile).first()
+            _pidConfig.value = config
+            gpsManager.fusion.useKalman = config.useKalmanFilter
+        }
+    }
 
     // ── Autopilot BLE ─────────────────────────────────────────────────────────
     val connectionState: StateFlow<BleConnectionState> = bleManager.connectionState
@@ -61,15 +77,19 @@ class AutopilotViewModel(application: Application) : AndroidViewModel(applicatio
             gps.hasHeading                          -> gps.headingDeg
             else                                    -> apState.currentHeading
         }
+        // shaftAngleDeg always updated from A5 packets — independent of heading source.
+        // The shaft sensor provides position feedback regardless of GPS/IMU heading.
+        val withShaft = apState.copy(
+            shaftAngleDeg = gps.shaftAngleDeg ?: apState.shaftAngleDeg
+        )
         if (gps.hasHeading || imuConn is ImuConnectionState.Connected) {
-            apState.copy(
+            withShaft.copy(
                 currentHeading = heading,
                 speedKnots     = if (gps.hasHeading) gps.speedKnots else apState.speedKnots,
                 latitude       = if (gps.hasFix)     gps.latDeg     else apState.latitude,
-                longitude      = if (gps.hasFix)     gps.lonDeg     else apState.longitude,
-                shaftAngleDeg  = gps.shaftAngleDeg   // from A5 MMC5603 packet
+                longitude      = if (gps.hasFix)     gps.lonDeg     else apState.longitude
             )
-        } else apState
+        } else withShaft
     }.stateIn(viewModelScope, SharingStarted.Eagerly, AutopilotState())
 
     // ── PID + Deadband Config (persisted via DataStore) ──────────────────────
@@ -78,7 +98,7 @@ class AutopilotViewModel(application: Application) : AndroidViewModel(applicatio
 
     private fun updateAndSave(newConfig: PidConfig) {
         _pidConfig.value = newConfig
-        viewModelScope.launch { settingsRepo.savePidConfig(newConfig) }
+        viewModelScope.launch { settingsRepo.savePidConfig(_activeProfile.value, newConfig) }
     }
 
     fun updatePidKp(v: Float)             { updateAndSave(_pidConfig.value.copy(kp = v)) }
@@ -92,6 +112,10 @@ class AutopilotViewModel(application: Application) : AndroidViewModel(applicatio
     fun updateMaxScaleSpeed(v: Float)     { updateAndSave(_pidConfig.value.copy(maxScaleSpeedKt = v)) }
     fun updateMinSpeedScale(v: Float)     { updateAndSave(_pidConfig.value.copy(minSpeedScale = v)) }
     fun updateSteerScale(v: Int)          { updateAndSave(_pidConfig.value.copy(steerScaleMs = v)) }
+    fun updateUseKalman(v: Boolean) {
+        updateAndSave(_pidConfig.value.copy(useKalmanFilter = v))
+        gpsManager.fusion.useKalman = v
+    }
 
     fun applyPid() {
         val config = _pidConfig.value
@@ -135,9 +159,12 @@ class AutopilotViewModel(application: Application) : AndroidViewModel(applicatio
     init {
         // Load persisted settings on startup
         viewModelScope.launch {
-            settingsRepo.pidConfigFlow.first().let { saved ->
-                _pidConfig.value = saved
-            }
+            // Restore active profile then load its PidConfig
+            val profile = settingsRepo.activeProfileFlow.first()
+            _activeProfile.value = profile
+            val saved = settingsRepo.pidConfigFlow(profile).first()
+            _pidConfig.value = saved
+            gpsManager.fusion.useKalman = saved.useKalmanFilter
         }
 
         gpsManager.onUpdate = { data ->
@@ -196,7 +223,7 @@ class AutopilotViewModel(application: Application) : AndroidViewModel(applicatio
 
     // ── SensorFusion tuning ───────────────────────────────────────────────────
     val fusion get() = gpsManager.fusion
-    fun setUseKalman(v: Boolean) { gpsManager.fusion.useKalman = v }
+    fun setUseKalman(v: Boolean) { updateUseKalman(v) }   // persists via updateUseKalman
 
     // ── Phone-side PID shadow (for display / future soft-PID) ────────────────
     // Computes what the PID would output — useful for tuning even when the

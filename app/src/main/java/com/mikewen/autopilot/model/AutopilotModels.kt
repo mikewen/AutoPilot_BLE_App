@@ -21,6 +21,28 @@ enum class AutopilotType(val displayName: String, val description: String) {
     )
 }
 
+/**
+ * BoatProfile — each profile stores its own PidConfig independently.
+ * Switch profile to instantly recall per-boat tuning.
+ */
+enum class BoatProfile(val displayName: String, val icon: String, val description: String) {
+    CL16(
+        displayName = "CL16",
+        icon        = "⛵",
+        description = "CL 16 — tiller autopilot"
+    ),
+    MAC25(
+        displayName = "Mac25",
+        icon        = "🚢",
+        description = "Macgregor 25 — main boat"
+    ),
+    TOY(
+        displayName = "Toy",
+        icon        = "🛥",
+        description = "Test / toy boat — development"
+    )
+}
+
 // ─────────────────────────────────────────────
 // Autopilot BLE Connection State
 // ─────────────────────────────────────────────
@@ -158,7 +180,11 @@ data class PidConfig(
     // GPS_Steer steer motor scale: runtimeMs = steerScaleMs * abs(step)
     // step=1 → one small tap, step=5 → larger move
     // Default 200 ms per step unit — tune to your actuator speed.
-    val steerScaleMs:      Int   = 200
+    val steerScaleMs:      Int     = 200,
+
+    // Use Kalman filter in SensorFusion instead of complementary filter.
+    // Kalman is more accurate but heavier — persisted so it survives restarts.
+    val useKalmanFilter:   Boolean = false
 )
 
 // ─────────────────────────────────────────────

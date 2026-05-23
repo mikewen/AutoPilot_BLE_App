@@ -89,8 +89,13 @@ class GpsManager(private val context: Context) {
 
     val fusion = SensorFusion()
 
-    private var shaftHardIronX = 0f
-    private var shaftHardIronY = 0f
+    // ── Shaft LUT calibration points (raw X/Y at each reference position) ────
+    private var shaftZeroX  = 0f;  private var shaftZeroY  = 0f  // rudder centre
+    private var shaftPortX  = 0f;  private var shaftPortY  = 0f  // full port
+    private var shaftStbdX  = 0f;  private var shaftStbdY  = 0f  // full stbd
+    private var shaftPortMaxDeg = 45f   // physical port travel in degrees
+    private var shaftStbdMaxDeg = 45f   // physical stbd travel in degrees
+    private var shaftLutValid   = false  // true once all 3 points are set
 
     init {
         // Restore saved magnetic declination from SharedPreferences
@@ -107,8 +112,15 @@ class GpsManager(private val context: Context) {
         fusion.gyroBiasX = calPrefs.getFloat("gyro_bias_x", 0f)
         fusion.gyroBiasY = calPrefs.getFloat("gyro_bias_y", 0f)
         fusion.gyroBiasZ = calPrefs.getFloat("gyro_bias_z", 0f)
-        shaftHardIronX   = calPrefs.getFloat("shaft_hard_iron_x", 0f)
-        shaftHardIronY   = calPrefs.getFloat("shaft_hard_iron_y", 0f)
+        shaftZeroX  = calPrefs.getFloat("shaft_zero_x",   0f)
+        shaftZeroY  = calPrefs.getFloat("shaft_zero_y",   0f)
+        shaftPortX  = calPrefs.getFloat("shaft_port_x",   0f)
+        shaftPortY  = calPrefs.getFloat("shaft_port_y",   0f)
+        shaftStbdX  = calPrefs.getFloat("shaft_stbd_x",   0f)
+        shaftStbdY  = calPrefs.getFloat("shaft_stbd_y",   0f)
+        shaftPortMaxDeg = calPrefs.getFloat("shaft_port_max_deg", 45f)
+        shaftStbdMaxDeg = calPrefs.getFloat("shaft_stbd_max_deg", 45f)
+        shaftLutValid   = shaftZeroX != 0f || shaftZeroY != 0f
 
         // Persist declination whenever auto-updated from GPS
         fusion.onDeclinationUpdated = { decl ->
@@ -117,119 +129,81 @@ class GpsManager(private val context: Context) {
         }
     }
 
-    // ── Shaft / rudder position sensor (MMC5603 A5 packet) ──────────────────────
+    // ── Shaft / rudder position sensor — 3-point LUT calibration ──────────────
     //
-    // Hard-iron calibration using least-squares ellipse fit.
+    // Limited-travel rudders (e.g. ±45°) cannot do a full 360° rotation, so the
+    // least-squares ellipse fit is not usable.  Instead we use a 3-point LUT:
     //
-    // WHY LEAST-SQUARES:
-    //   The bounding-box (min/max) method assumes the ellipse axes are aligned
-    //   with the sensor axes.  In practice the sensor is never perfectly mounted,
-    //   so the ellipse is tilted and the bounding-box centre is wrong by several
-    //   degrees.  The least-squares method fits the general conic
-    //     A·x² + B·x·y + C·y² + D·x + E·y = 1
-    //   to the raw (X,Y) cloud and extracts the true ellipse centre analytically:
-    //     cx = (B·E − 2·C·D) / (4·A·C − B²)
-    //     cy = (B·D − 2·A·E) / (4·A·C − B²)
-    //   This is correct regardless of sensor orientation.
+    //   1. User centres rudder → taps SET ZERO  → records raw X/Y as neutral
+    //   2. User drives to full port  → taps SET PORT  → records raw X/Y + portDeg
+    //   3. User drives to full stbd  → taps SET STBD  → records raw X/Y + stbdDeg
     //
-    // SAMPLE COUNT:
-    //   More samples help only if they fill gaps in the arc.
-    //   Once you have ≥ 1 sample every ~5° (72 samples for 360°) adding more
-    //   has no further benefit.  Minimum is 36 (every ~10°).
-    //   At 20 Hz a slow full sweep (~18 s) gives ~360 samples — more than enough.
+    // Angle computation:
+    //   Compute arc angle from zero to sample using atan2, project onto the
+    //   zero→port or zero→stbd reference arc, then scale linearly to degrees.
+    //
+    //   arcAngle = atan2 cross/dot product of (zero vector, sample vector)
+    //   sign determines port (−) or stbd (+) side.
+    //   output = arcAngle / refArcAngle * maxDeg
 
-    private val shaftCalPoints  = mutableListOf<Pair<Float, Float>>()
-    private var shaftCalActive  = false
+    private val shaftCalPoints   = mutableListOf<Pair<Float, Float>>()   // kept for future use
+    private var shaftCalActive   = false
     private var lastShaftAngleDeg: Float? = null
+    var lastShaftRawX: Float = 0f
+        private set
+    var lastShaftRawY: Float = 0f
+        private set
 
-    fun startShaftCal() {
-        shaftCalActive = true
-        shaftCalPoints.clear()
-        Log.i(TAG, "Shaft cal started — least-squares ellipse fit")
+    // ── 3-point LUT public API ────────────────────────────────────────────────
+
+    /** Record current raw X/Y as rudder centre (neutral position). */
+    fun setShaftZero() {
+        shaftZeroX = lastShaftRawX; shaftZeroY = lastShaftRawY
+        shaftLutValid = checkLutValid()
+        Log.i(TAG, "Shaft ZERO set: X=%.0f Y=%.0f".format(shaftZeroX, shaftZeroY))
     }
 
-    /**
-     * Finish calibration and compute hard-iron offset via least-squares ellipse fit.
-     * Falls back to bounding-box centre if the linear system is degenerate.
-     * Minimum 36 samples required.
-     */
-    fun finishShaftCal(): Boolean {
-        shaftCalActive = false
-        val n = shaftCalPoints.size
-        if (n < 36) {
-            Log.w(TAG, "Shaft cal: only $n samples — need ≥ 36")
-            return false
-        }
-
-        // Build 5×5 normal matrix MᵀM and RHS vector Mᵀ1
-        // Each row of M: [x², x·y, y², x, y]
-        val mtm = Array(5) { DoubleArray(5) }
-        val mtr = DoubleArray(5)
-        for ((xf, yf) in shaftCalPoints) {
-            val x = xf.toDouble(); val y = yf.toDouble()
-            val row = doubleArrayOf(x*x, x*y, y*y, x, y)
-            for (i in 0..4) {
-                mtr[i] += row[i]
-                for (j in 0..4) mtm[i][j] += row[i] * row[j]
-            }
-        }
-
-        val p = solveLinear5(mtm, mtr) ?: run {
-            // Degenerate — fall back to bounding-box
-            Log.w(TAG, "Shaft cal: singular matrix — bounding-box fallback")
-            val xs = shaftCalPoints.map { it.first }
-            val ys = shaftCalPoints.map { it.second }
-            shaftHardIronX = (xs.min() + xs.max()) / 2f
-            shaftHardIronY = (ys.min() + ys.max()) / 2f
-            Log.i(TAG, "Shaft cal fallback: X=%.1f Y=%.1f n=$n"
-                .format(shaftHardIronX, shaftHardIronY))
-            return true
-        }
-
-        val a = p[0]; val b = p[1]; val cc = p[2]; val d = p[3]; val e = p[4]
-        val denom = 4.0 * a * cc - b * b
-        if (kotlin.math.abs(denom) < 1e-10) {
-            Log.w(TAG, "Shaft cal: degenerate ellipse (denom=$denom)")
-            return false
-        }
-        shaftHardIronX = ((b * e - 2.0 * cc * d) / denom).toFloat()
-        shaftHardIronY = ((b * d - 2.0 * a  * e) / denom).toFloat()
-
-        Log.i(TAG, "Shaft cal LS: X=%.1f Y=%.1f n=$n A=%.4f B=%.4f C=%.4f"
-            .format(shaftHardIronX, shaftHardIronY, a, b, cc))
-        return true
+    /** Record current raw X/Y as full-port limit.
+     *  @param portDeg physical port travel in degrees (positive value, e.g. 45) */
+    fun setShaftPort(portDeg: Float = 45f) {
+        shaftPortX = lastShaftRawX; shaftPortY = lastShaftRawY
+        shaftPortMaxDeg = portDeg
+        shaftLutValid = checkLutValid()
+        Log.i(TAG, "Shaft PORT set: X=%.0f Y=%.0f maxDeg=%.1f".format(shaftPortX, shaftPortY, portDeg))
     }
 
-    /**
-     * Solve 5×5 linear system Ax=b via Gaussian elimination with partial pivoting.
-     * Returns null if the matrix is singular.
-     */
-    private fun solveLinear5(a: Array<DoubleArray>, b: DoubleArray): DoubleArray? {
-        val n = 5
-        val m = Array(n) { i -> DoubleArray(n + 1) { j -> if (j < n) a[i][j] else b[i] } }
-        for (col in 0 until n) {
-            var maxRow = col
-            for (row in col+1 until n)
-                if (kotlin.math.abs(m[row][col]) > kotlin.math.abs(m[maxRow][col])) maxRow = row
-            val tmp = m[col]; m[col] = m[maxRow]; m[maxRow] = tmp
-            if (kotlin.math.abs(m[col][col]) < 1e-12) return null
-            for (row in col+1 until n) {
-                val f = m[row][col] / m[col][col]
-                for (k in col..n) m[row][k] -= f * m[col][k]
-            }
-        }
-        val x = DoubleArray(n)
-        for (i in n-1 downTo 0) {
-            x[i] = m[i][n]
-            for (j in i+1 until n) x[i] -= m[i][j] * x[j]
-            x[i] /= m[i][i]
-        }
-        return x
+    /** Record current raw X/Y as full-stbd limit.
+     *  @param stbdDeg physical stbd travel in degrees (positive value, e.g. 45) */
+    fun setShaftStbd(stbdDeg: Float = 45f) {
+        shaftStbdX = lastShaftRawX; shaftStbdY = lastShaftRawY
+        shaftStbdMaxDeg = stbdDeg
+        shaftLutValid = checkLutValid()
+        Log.i(TAG, "Shaft STBD set: X=%.0f Y=%.0f maxDeg=%.1f".format(shaftStbdX, shaftStbdY, stbdDeg))
     }
 
+    private fun checkLutValid(): Boolean {
+        // At minimum zero + one side must be set (non-zero vector length from zero)
+        val portVecLen = Math.sqrt(((shaftPortX-shaftZeroX).toDouble().pow(2) +
+                (shaftPortY-shaftZeroY).toDouble().pow(2)))
+        val stbdVecLen = Math.sqrt(((shaftStbdX-shaftZeroX).toDouble().pow(2) +
+                (shaftStbdY-shaftZeroY).toDouble().pow(2)))
+        return portVecLen > 100.0 || stbdVecLen > 100.0
+    }
+
+    fun getLutPoints() = Triple(
+        Pair(shaftZeroX, shaftZeroY),
+        Pair(shaftPortX, shaftPortY),
+        Pair(shaftStbdX, shaftStbdY)
+    )
+    fun getLutMaxDeg() = Pair(shaftPortMaxDeg, shaftStbdMaxDeg)
+    val isShaftLutValid get() = shaftLutValid
+
+    // Kept for compatibility with CalibrationScreen sweep flow (no-op now)
+    fun startShaftCal() { shaftCalActive = true;  shaftCalPoints.clear() }
+    fun finishShaftCal(): Boolean { shaftCalActive = false; return shaftLutValid }
     val isShaftCalActive    get() = shaftCalActive
     val shaftCalSampleCount get() = shaftCalPoints.size
-    fun getShaftHardIron()   = Pair(shaftHardIronX, shaftHardIronY)
+    fun getShaftHardIron()   = Pair(shaftZeroX, shaftZeroY)  // compat stub
 
     /** Persist current calibration values to SharedPreferences. */
     fun saveCalibration() {
@@ -240,8 +214,14 @@ class GpsManager(private val context: Context) {
             .putFloat("gyro_bias_x", fusion.gyroBiasX)
             .putFloat("gyro_bias_y", fusion.gyroBiasY)
             .putFloat("gyro_bias_z", fusion.gyroBiasZ)
-            .putFloat("shaft_hard_iron_x", shaftHardIronX)
-            .putFloat("shaft_hard_iron_y", shaftHardIronY)
+            .putFloat("shaft_zero_x",       shaftZeroX)
+            .putFloat("shaft_zero_y",       shaftZeroY)
+            .putFloat("shaft_port_x",       shaftPortX)
+            .putFloat("shaft_port_y",       shaftPortY)
+            .putFloat("shaft_stbd_x",       shaftStbdX)
+            .putFloat("shaft_stbd_y",       shaftStbdY)
+            .putFloat("shaft_port_max_deg", shaftPortMaxDeg)
+            .putFloat("shaft_stbd_max_deg", shaftStbdMaxDeg)
             .apply()
     }
 
@@ -518,62 +498,137 @@ class GpsManager(private val context: Context) {
     }
 
     /**
-     * A5 packet — MMC5603NJ shaft/rudder position sensor (GPS_Steer firmware)
+     * A5 packet — shaft/rudder position sensor (GPS_Steer firmware).
      *
-     * A5 packet layout (bytes after the 0xA5 header and sequence byte):
-     *   Packet byte:  Firmware source register:
-     *   b[0]          0x00  X[19:12]
-     *   b[1]          0x01  X[11:4]
-     *   b[2]          0x02  Y[19:12]
-     *   b[3]          0x03  Y[11:4]
-     *   b[4]          0x04  Z[19:12]
-     *   b[5]          0x05  Z[11:4]
-     *   b[6]          0x06  X[3:0]  (bits 7:4)
-     *   b[7]          0x07  Y[3:0]  (bits 7:4)
-     *   b[8]          0x08  Z[3:0]  (bits 7:4)
+     * Auto-detects sensor type by packet length:
      *
-     * Full packet including header: 11 bytes
-     *   byte 0  = 0xA5 header
-     *   byte 1  = sequence counter
-     *   bytes 2-10 = 9 register bytes above
+     *   11 bytes → MMC5603NJ  (20-bit, unsigned centred at 524288)
+     *     byte 0  : 0xA5 header
+     *     byte 1  : sequence
+     *     byte 2  : X[19:12]    byte 3  : X[11:4]
+     *     byte 4  : Y[19:12]    byte 5  : Y[11:4]
+     *     byte 6  : Z[19:12]    byte 7  : Z[11:4]
+     *     byte 8  : X[3:0] bits7:4  Y[3:0] bits3:0 — packed nibbles
+     *     byte 9  : Y[3:0] bits7:4
+     *     byte 10 : Z[3:0] bits7:4
      *
-     * MMC5603NJ outputs are unsigned, centred at 524288 (2^19).
-     * Signed value = unsigned - 524288.
+     *   8 bytes → QMC6308  (16-bit signed little-endian)
+     *     byte 0  : 0xA5 header
+     *     byte 1  : sequence
+     *     byte 2-3: X int16 LE
+     *     byte 4-5: Y int16 LE
+     *     byte 6-7: Z int16 LE  (available for future tilt compensation)
      */
+
+    /**
+     * Compute shaft angle in degrees from raw X/Y using the 3-point LUT.
+     * Uses signed arc angle (atan2 of cross/dot) scaled against port/stbd reference arcs.
+     */
+    /**
+     * Compute shaft angle using 3-point LUT — nearest-segment projection.
+     *
+     * All coordinates translated to zero = origin.
+     * We measure the signed arc from the zero vector to the sample vector
+     * using atan2(cross, dot), then normalise against each reference arc.
+     * Side is determined by which fraction falls in [0, 1].
+     * This is stable regardless of magnet N/S axis orientation.
+     */
+    private fun computeShaftAngleLut(rawX: Float, rawY: Float): Float {
+        val sx = (rawX - shaftZeroX).toDouble()
+        val sy = (rawY - shaftZeroY).toDouble()
+        val px = (shaftPortX - shaftZeroX).toDouble()
+        val py = (shaftPortY - shaftZeroY).toDouble()
+        val tx = (shaftStbdX - shaftZeroX).toDouble()
+        val ty = (shaftStbdY - shaftZeroY).toDouble()
+
+        if (sx * sx + sy * sy < 1.0) return 0f
+
+        // atan2(cross, dot) = signed arc from vector a to vector b (CCW positive)
+        fun signedArcRad(ax: Double, ay: Double, bx: Double, by: Double): Double {
+            val dot   = ax * bx + ay * by
+            val cross = ax * by - ay * bx
+            return Math.atan2(cross, dot)
+        }
+
+        // Arc from +X axis to each reference and to sample
+        val arcToPort   = signedArcRad(1.0, 0.0, px, py)
+        val arcToStbd   = signedArcRad(1.0, 0.0, tx, ty)
+        val arcToSample = signedArcRad(1.0, 0.0, sx, sy)
+
+        // Fraction of reference arc covered by the sample
+        // fraction = 0 at zero, = 1.0 at the reference point
+        val portFraction = if (Math.abs(arcToPort) > 0.01)
+            arcToSample / arcToPort else 0.0
+        val stbdFraction = if (Math.abs(arcToStbd) > 0.01)
+            arcToSample / arcToStbd else 0.0
+
+        // A fraction in [0, 1.2] means the sample is within (or just past)
+        // the reference arc — 1.2 gives 20% tolerance for sensor noise.
+        val onPort = portFraction in 0.0..1.2
+        val onStbd = stbdFraction in 0.0..1.2
+
+        // Dot products tell us which reference point the sample is closest to
+        val dotPort = px * sx + py * sy
+        val dotStbd = tx * sx + ty * sy
+
+        return when {
+            onPort && !onStbd ->
+                (-portFraction * shaftPortMaxDeg).toFloat()
+                    .coerceIn(-shaftPortMaxDeg, 0f)
+            onStbd && !onPort ->
+                (stbdFraction * shaftStbdMaxDeg).toFloat()
+                    .coerceIn(0f, shaftStbdMaxDeg)
+            onPort && onStbd ->
+                // Ambiguous: use dot proximity
+                if (dotPort >= dotStbd)
+                    (-portFraction * shaftPortMaxDeg).toFloat().coerceIn(-shaftPortMaxDeg, 0f)
+                else
+                    (stbdFraction  * shaftStbdMaxDeg).toFloat().coerceIn(0f, shaftStbdMaxDeg)
+            else ->
+                // Outside both arcs: clamp to nearest extreme
+                if (dotPort > dotStbd) -shaftPortMaxDeg else shaftStbdMaxDeg
+        }
+    }
+
+
     private fun parseA5Shaft(b: ByteArray) {
-        if (b.size < 11) return
+        val rawX: Float
+        val rawY: Float
 
-        // b[0]=header, b[1]=seq — data starts at b[2]
-        val d = b  // use full array; data bytes at indices 2..10
+        when (b.size) {
+            11 -> {
+                // ── MMC5603NJ — 20-bit unsigned centred at 524288 ────────────────
+                val xU = ((b[2].toInt() and 0xFF) shl 12) or
+                        ((b[3].toInt() and 0xFF) shl 4)  or
+                        ((b[8].toInt() and 0xF0) ushr 4)
+                val yU = ((b[4].toInt() and 0xFF) shl 12) or
+                        ((b[5].toInt() and 0xFF) shl 4)  or
+                        ((b[9].toInt() and 0xF0) ushr 4)
+                rawX = (xU - 524288).toFloat()
+                rawY = (yU - 524288).toFloat()
+            }
+            8 -> {
+                // ── QMC6308 — 16-bit signed little-endian ────────────────────────
+                rawX = ((b[2].toInt() and 0xFF) or ((b[3].toInt()) shl 8)).toShort().toFloat()
+                rawY = ((b[4].toInt() and 0xFF) or ((b[5].toInt()) shl 8)).toShort().toFloat()
+            }
+            else -> return   // unknown sensor / truncated packet
+        }
 
-        val xUnsigned = ((d[2].toInt() and 0xFF) shl 12) or
-                ((d[3].toInt() and 0xFF) shl 4)  or
-                ((d[8].toInt() and 0xF0) ushr 4)   // X[3:0] in bits 7:4 of reg 0x06
+        // Store raw values for calibration display
+        lastShaftRawX = rawX
+        lastShaftRawY = rawY
 
-        val yUnsigned = ((d[4].toInt() and 0xFF) shl 12) or
-                ((d[5].toInt() and 0xFF) shl 4)  or
-                ((d[9].toInt() and 0xF0) ushr 4)   // Y[3:0] in bits 7:4 of reg 0x07
-
-        val zUnsigned = ((d[6].toInt() and 0xFF) shl 12) or
-                ((d[7].toInt() and 0xFF) shl 4)  or
-                ((d[10].toInt() and 0xF0) ushr 4)  // Z[3:0] in bits 7:4 of reg 0x08
-
-        // Convert unsigned centered-at-524288 to signed
-        val rawX = (xUnsigned - 524288).toFloat()
-        val rawY = (yUnsigned - 524288).toFloat()
-        // rawZ available if needed for tilt compensation later
-
-        // Collect raw sample for least-squares fit
+        // Collect raw sample for least-squares ellipse fit
         if (shaftCalActive) {
             shaftCalPoints.add(Pair(rawX, rawY))
         }
 
-        // Apply hard-iron offset and compute shaft angle
-        val cx = rawX - shaftHardIronX
-        val cy = rawY - shaftHardIronY
-        lastShaftAngleDeg = Math.toDegrees(Math.atan2(cy.toDouble(), cx.toDouble())).toFloat()
+        // Compute shaft angle: LUT when calibrated, raw atan2 otherwise
+        lastShaftAngleDeg = if (shaftLutValid) computeShaftAngleLut(rawX, rawY)
+        else Math.toDegrees(Math.atan2(rawY.toDouble(), rawX.toDouble())).toFloat()
 
-        // Push update so UI refreshes with new shaft angle
+        // Push update so UI refreshes
         currentData = currentData.copy(shaftAngleDeg = lastShaftAngleDeg)
         onUpdate?.invoke(currentData)
     }

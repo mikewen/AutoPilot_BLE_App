@@ -29,7 +29,8 @@ fun SettingsScreen(
     onBack: () -> Unit,
     onCalibration: () -> Unit
 ) {
-    val pid = vm.pidConfig.collectAsState().value
+    val pid     = vm.pidConfig.collectAsState().value
+    val profile = vm.activeProfile.collectAsState().value
     val snackbarHostState = remember { SnackbarHostState() }
     var snackMessage by remember { mutableStateOf<String?>(null) }
 
@@ -52,7 +53,11 @@ fun SettingsScreen(
                 IconButton(onClick = onBack) {
                     Icon(Icons.Default.ArrowBack, "Back", tint = TealAccent)
                 }
-                Text("SETTINGS", style = MaterialTheme.typography.titleLarge, color = Color.White)
+                Column(Modifier.weight(1f)) {
+                    Text("SETTINGS", style = MaterialTheme.typography.titleLarge, color = Color.White)
+                    Text("${profile.icon} ${profile.displayName}",
+                        style = MaterialTheme.typography.labelMedium, color = TealAccent)
+                }
             }
         }
     ) { padding ->
@@ -84,6 +89,26 @@ fun SettingsScreen(
                             style = MaterialTheme.typography.labelMedium, color = Muted)
                     }
                     Icon(Icons.Default.ChevronRight, null, tint = TealAccent)
+                }
+            }
+
+            // ── Profile banner ──────────────────────────────────────────────────
+            Surface(
+                color  = TealAccent.copy(0.1f),
+                shape  = RoundedCornerShape(10.dp),
+                border = BorderStroke(1.dp, TealAccent.copy(0.3f)),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Row(Modifier.padding(12.dp),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalAlignment = Alignment.CenterVertically) {
+                    Text(profile.icon, fontSize = 28.sp)
+                    Column {
+                        Text("${profile.displayName} — ${profile.description}",
+                            style = MaterialTheme.typography.titleMedium, color = TealAccent)
+                        Text("Settings below are saved for this boat only.",
+                            style = MaterialTheme.typography.labelMedium, color = Muted)
+                    }
                 }
             }
 
@@ -169,9 +194,10 @@ fun SettingsScreen(
                         Text("Steer scale", style = MaterialTheme.typography.labelLarge, color = TealAccent)
                         Text(
                             "runtimeMs = steerScaleMs \u00d7 abs(step). " +
-                                    "L1/R1 buttons \u2192 1 step, L5/R5 \u2192 5 steps. " +
+                                    "L1/R1 buttons → 1 step, L5/R5 → 5 steps. " +
                                     "Tune so 1 step moves the rudder ~1\u00b0.",
-                            style = MaterialTheme.typography.bodyMedium, color = Muted)
+                            style = MaterialTheme.typography.bodyMedium, color = Muted
+                        )
                     }
                 }
                 Spacer(Modifier.height(4.dp))
@@ -286,21 +312,18 @@ internal fun ParamSlider(
     onValueChange: (Float) -> Unit
 ) {
     var editing       by remember { mutableStateOf(false) }
-    var hadFocus      by remember { mutableStateOf(false) }
-    var textValue     by remember(value, editing) {
+    var textValue     by remember(value) {
         mutableStateOf(TextFieldValue(
             text      = if (unit == " ms") value.toInt().toString()
             else String.format("%.2f", value),
-            selection = if (editing) TextRange(0, 99) else TextRange.Zero
+            selection = TextRange(0, 99)   // select all on open
         ))
     }
     val focusRequester = remember { FocusRequester() }
     val focusManager   = LocalFocusManager.current
 
     fun commitText() {
-        if (!editing) return
-        val cleanText = textValue.text.replace(',', '.').trim()
-        val parsed = cleanText.toFloatOrNull()
+        val parsed = textValue.text.trim().toFloatOrNull()
         if (parsed != null) {
             onValueChange(parsed.coerceIn(range.start, range.endInclusive))
         }
@@ -323,10 +346,7 @@ internal fun ParamSlider(
                     modifier        = Modifier
                         .width(110.dp)
                         .focusRequester(focusRequester)
-                        .onFocusChanged {
-                            if (it.isFocused) hadFocus = true
-                            if (hadFocus && !it.isFocused) commitText()
-                        },
+                        .onFocusChanged { if (!it.isFocused) editing = false },
                     singleLine      = true,
                     suffix          = { Text(unit, color = Muted) },
                     textStyle       = MaterialTheme.typography.titleMedium
@@ -347,7 +367,7 @@ internal fun ParamSlider(
             } else {
                 // Tappable value chip — tap to edit
                 Surface(
-                    onClick = { editing = true; hadFocus = false },
+                    onClick = { editing = true },
                     color   = NavyMid,
                     shape   = RoundedCornerShape(8.dp),
                     border  = BorderStroke(1.dp, TealAccent.copy(0.4f))

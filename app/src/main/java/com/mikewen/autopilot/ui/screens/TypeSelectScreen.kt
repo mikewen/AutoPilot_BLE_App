@@ -15,10 +15,15 @@ import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.*
 import com.mikewen.autopilot.model.AutopilotType
+import com.mikewen.autopilot.model.BoatProfile
 import com.mikewen.autopilot.ui.theme.*
 
 @Composable
-fun TypeSelectScreen(onTypeSelected: (AutopilotType) -> Unit) {
+fun TypeSelectScreen(
+    vm: com.mikewen.autopilot.viewmodel.AutopilotViewModel,
+    onTypeSelected: (AutopilotType) -> Unit
+) {
+    val activeProfile by vm.activeProfile.collectAsState()
 
     val infiniteTransition = rememberInfiniteTransition(label = "bg")
     val shimmer by infiniteTransition.animateFloat(
@@ -60,6 +65,50 @@ fun TypeSelectScreen(onTypeSelected: (AutopilotType) -> Unit) {
                     color = Muted,
                     letterSpacing = 4.sp
                 )
+            }
+
+            HorizontalDivider(color = NavyLight, thickness = 1.dp)
+
+            // ── Boat Profile Selector ──────────────────────────────────────────
+            Text(
+                "SELECT BOAT",
+                style = MaterialTheme.typography.labelLarge,
+                color = Muted,
+                textAlign = TextAlign.Center
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                BoatProfile.entries.forEach { profile ->
+                    val isSelected = profile == activeProfile
+                    Card(
+                        modifier = Modifier
+                            .weight(1f)
+                            .clickable { vm.selectProfile(profile) },
+                        shape  = RoundedCornerShape(12.dp),
+                        colors = CardDefaults.cardColors(
+                            containerColor = if (isSelected) TealAccent.copy(0.15f) else SurfaceCard
+                        ),
+                        border = BorderStroke(
+                            width = if (isSelected) 2.dp else 1.dp,
+                            color = if (isSelected) TealAccent else NavyLight
+                        )
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(12.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Text(profile.icon, fontSize = 24.sp)
+                            Text(
+                                profile.displayName,
+                                style = MaterialTheme.typography.labelLarge,
+                                color = if (isSelected) TealAccent else Color.White
+                            )
+                        }
+                    }
+                }
             }
 
             HorizontalDivider(color = NavyLight, thickness = 1.dp)

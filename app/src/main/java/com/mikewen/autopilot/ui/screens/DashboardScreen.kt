@@ -36,6 +36,7 @@ fun DashboardScreen(
 ) {
     val connection  by vm.connectionState.collectAsState()
     val type        by vm.selectedType.collectAsState()
+    val profile     by vm.activeProfile.collectAsState()
     val target      by vm.targetHeading.collectAsState()
     val history     by vm.headingHistory.collectAsState()
     val pidConfig   by vm.pidConfig.collectAsState()
@@ -46,7 +47,7 @@ fun DashboardScreen(
     val targetWp    by vm.targetWaypoint.collectAsState()
 
     Column(Modifier.fillMaxSize().background(NavyDeep)) {
-        TopBar(connection, imuConn, onSettings, onMapTarget, onDisconnect)
+        TopBar(connection, imuConn, profile, onSettings, onMapTarget, onDisconnect)
 
         Column(
             modifier = Modifier
@@ -125,6 +126,7 @@ fun DashboardScreen(
 private fun TopBar(
     connection: BleConnectionState,
     imuConn: ImuConnectionState,
+    profile: com.mikewen.autopilot.model.BoatProfile,
     onSettings: () -> Unit,
     onMapTarget: () -> Unit,
     onDisconnect: () -> Unit
@@ -143,7 +145,10 @@ private fun TopBar(
     ) {
         Column(Modifier.weight(1f)) {
             Text(name, style = MaterialTheme.typography.titleMedium, color = TealAccent)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically) {
+                Text("${profile.icon} ${profile.displayName}",
+                    style = MaterialTheme.typography.labelMedium, color = TealAccent)
                 Text(rssi, style = MaterialTheme.typography.labelMedium, color = Muted)
                 if (imuName != null) {
                     Text("•", style = MaterialTheme.typography.labelMedium, color = Muted)

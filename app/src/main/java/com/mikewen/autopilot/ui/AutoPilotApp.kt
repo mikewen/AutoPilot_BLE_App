@@ -26,6 +26,7 @@ fun AutoPilotApp(vm: AutopilotViewModel = viewModel()) {
         composable(Screen.TypeSelect.route) {
             // System back on the root screen exits the app — default behaviour, no BackHandler needed
             TypeSelectScreen(
+                vm = vm,
                 onTypeSelected = { type ->
                     vm.selectAutopilotType(type)
                     navController.navigate(Screen.Scan.route)
