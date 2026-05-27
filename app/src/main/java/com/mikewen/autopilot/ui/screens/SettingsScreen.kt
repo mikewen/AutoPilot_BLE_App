@@ -4,7 +4,6 @@ import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.*
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -24,6 +23,7 @@ import androidx.compose.ui.platform.LocalFocusManager
 import com.mikewen.autopilot.ui.theme.*
 import com.mikewen.autopilot.viewmodel.AutopilotViewModel
 import java.util.Locale
+import androidx.compose.material.icons.automirrored.filled.*
 
 @Composable
 fun SettingsScreen(
@@ -203,6 +203,7 @@ fun SettingsScreen(
                     }
                 }
                 Spacer(Modifier.height(4.dp))
+                // Integer slider 20..500 ms — use float internally, cast to Int
                 ParamSlider(
                     label       = "Steer scale",
                     value       = pid.steerScaleMs.toFloat(),
@@ -224,6 +225,58 @@ fun SettingsScreen(
                             }
                         }
                     }
+                }
+            }
+
+            // ── Steer Sensor Supervision ──────────────────────────────────────
+            SectionCard(title = "STEER SENSOR SUPERVISION") {
+                // Enable/disable switch
+                Row(Modifier.fillMaxWidth(), Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("Use steer sensor in PID loop",
+                            style = MaterialTheme.typography.bodyMedium, color = Color.White)
+                        Text("Limit enforcement, anti-windup, lag detection",
+                            style = MaterialTheme.typography.labelMedium, color = Muted)
+                    }
+                    Switch(
+                        checked         = pid.useSteerSensor,
+                        onCheckedChange = { vm.updateUseSteerSensor(it) },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor   = TealAccent,
+                            checkedTrackColor   = TealAccent.copy(0.4f),
+                            uncheckedThumbColor = Muted,
+                            uncheckedTrackColor = NavyMid
+                        )
+                    )
+                }
+                if (pid.useSteerSensor) {
+                    Spacer(Modifier.height(8.dp))
+                    // Requires shaft sensor calibration
+                    Surface(color = AmberWarn.copy(0.08f), shape = RoundedCornerShape(8.dp),
+                        border = BorderStroke(1.dp, AmberWarn.copy(0.3f))) {
+                        Row(Modifier.padding(10.dp),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Default.Warning, null,
+                                tint = AmberWarn, modifier = Modifier.size(16.dp))
+                            Text("Requires shaft sensor (A5) to be calibrated in Calibration screen.",
+                                style = MaterialTheme.typography.labelMedium, color = AmberWarn)
+                        }
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    ParamSlider("Port limit", pid.shaftLimitPortDeg, 10f..60f, "°",
+                        "Motor stops when shaft reaches this port angle",
+                        vm::updateShaftLimitPort)
+                    ParamSlider("Stbd limit", pid.shaftLimitStbdDeg, 10f..60f, "°",
+                        "Motor stops when shaft reaches this stbd angle",
+                        vm::updateShaftLimitStbd)
+                    ParamSlider("Lag threshold", pid.shaftLagThresholdDeg, 0.5f..10f, "°",
+                        "Min shaft movement expected within lag window",
+                        vm::updateShaftLagThreshold)
+                    ParamSlider("Lag window", pid.shaftLagWindowMs.toFloat(), 500f..5000f, " ms",
+                        "Time allowed before declaring actuator lag/failure",
+                        vm::updateShaftLagWindow)
                 }
             }
 
@@ -284,7 +337,7 @@ private fun DeadbandExplainer() {
             Text(
                 "When the heading error is smaller than the deadband, the PID output is forced to zero " +
                         "and the integral is reset. This prevents the motor from hunting (constantly correcting " +
-                        "tiny errors caused by waves). Typical values: 1\u00b0\u20135\u00b0.",
+                        "tiny errors caused by waves). Typical values: 1°–5°.",
                 style = MaterialTheme.typography.bodyMedium, color = Muted
             )
         }
@@ -312,13 +365,12 @@ internal fun ParamSlider(
     unit: String, description: String,
     onValueChange: (Float) -> Unit
 ) {
-    var editing by remember { mutableStateOf(false) }
-    
-    // textValue stores the current string while editing
-    var textValue by remember {
+    var editing       by remember { mutableStateOf(false) }
+    var textValue     by remember(value) {
         mutableStateOf(TextFieldValue(
-            if (unit == " ms") value.toInt().toString()
-            else String.format(Locale.US, "%.2f", value)
+            text      = if (unit == " ms") value.toInt().toString()
+            else String.format("%.2f", value),
+            selection = TextRange(0, 99)   // select all on open
         ))
     }
 
@@ -376,9 +428,9 @@ internal fun ParamSlider(
                         keyboardType = KeyboardType.Decimal,
                         imeAction    = ImeAction.Done
                     ),
-                    keyboardActions = KeyboardActions(onDone = { 
+                    keyboardActions = KeyboardActions(onDone = {
                         // Clear focus triggers onFocusChanged -> commitText()
-                        focusManager.clearFocus() 
+                        focusManager.clearFocus()
                     }),
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedBorderColor   = TealAccent,

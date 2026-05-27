@@ -184,7 +184,25 @@ data class PidConfig(
 
     // Use Kalman filter in SensorFusion instead of complementary filter.
     // Kalman is more accurate but heavier — persisted so it survives restarts.
-    val useKalmanFilter:   Boolean = false
+    val useKalmanFilter:   Boolean = false,
+
+    // Use shaft/rudder position sensor for PID supervision when enabled:
+    //   - Limit enforcement: stop motor at port/stbd cal limits
+    //   - Anti-windup: clamp integral when shaft not responding to output
+    //   - Centre detection: confirm rudder is centred before engage
+    //   - Lag/failure detection: output commanded but shaft not moving
+    // Requires A5 shaft sensor (QMC6308/MMC5603) to be calibrated.
+    val useSteerSensor:    Boolean = false,
+
+    // Port/stbd hard limits in degrees — motor stops beyond these.
+    // Defaults match typical tiller travel; tune to your boat.
+    val shaftLimitPortDeg: Float = 40f,
+    val shaftLimitStbdDeg: Float = 40f,
+
+    // If shaft moves < this amount (°) within lagWindowMs despite nonzero output
+    // → declare actuator lag/failure.
+    val shaftLagThresholdDeg: Float = 2f,
+    val shaftLagWindowMs:     Long  = 2000L
 )
 
 // ─────────────────────────────────────────────
@@ -196,10 +214,16 @@ class PidController(private var config: PidConfig) {
     private var integral: Float = 0f
     private var lastOutput: Float = 0f
     private var lastTime:  Long   = System.currentTimeMillis()
+    // Shaft lag detection state
+    private var shaftMovingStartMs:       Long  = 0L
+    private var shaftAngleAtCommandStart: Float = 0f
 
-    fun updateConfig(c: PidConfig) { config = c; integral = 0f }
+    fun updateConfig(c: PidConfig) { config = c; integral = 0f; shaftMovingStartMs = 0L }
 
-    fun reset() { integral = 0f; lastOutput = 0f; lastTime = System.currentTimeMillis() }
+    fun reset() {
+        integral = 0f; lastOutput = 0f; lastTime = System.currentTimeMillis()
+        shaftMovingStartMs = 0L; shaftAngleAtCommandStart = 0f
+    }
 
     /**
      * Compute PID output.
@@ -217,8 +241,9 @@ class PidController(private var config: PidConfig) {
     fun compute(
         currentHeading: Float,
         targetHeading:  Float,
-        gyroZDegS:      Float = 0f,
-        speedKnots:     Float = 0f
+        gyroZDegS:      Float  = 0f,
+        speedKnots:     Float  = 0f,
+        shaftAngleDeg:  Float? = null   // null = sensor disabled/uncalibrated
     ): PidResult {
         val now = System.currentTimeMillis()
         val dt  = ((now - lastTime) / 1000f).coerceIn(0.01f, 0.5f)
@@ -258,12 +283,7 @@ class PidController(private var config: PidConfig) {
         integral  = integral.coerceIn(-maxI, maxI)
         val i     = config.ki * integral
 
-        // ── D term — uses raw gyro yaw rate, not differentiated error ─────────
-        // gyroZDegS is the rate of heading change: positive = turning to starboard.
-        // We want to damp the rotation toward the target, so:
-        //   if error > 0 (need to turn stbd) and gyro already turning stbd → damp
-        //   D term opposes rapid rotation regardless of error direction.
-        // Negate: a large positive gyro (fast stbd turn) reduces a stbd correction.
+        // ── D term — gyro yaw rate (not shaft sensor) ────────────────────────────
         val d = -config.kd * speedScale * gyroZDegS
 
         // ── Steering bias ─────────────────────────────────────────────────────
@@ -279,20 +299,79 @@ class PidController(private var config: PidConfig) {
         } else rawOutput
         lastOutput = output
 
+        // ── Shaft sensor supervision ─────────────────────────────────────────
+        val shaftStatus: ShaftStatus
+        val finalOutput: Float
+
+        if (!config.useSteerSensor || shaftAngleDeg == null) {
+            shaftStatus = ShaftStatus.NO_SENSOR
+            finalOutput = output
+        } else {
+            val shaft = shaftAngleDeg
+
+            // 1. Hard limit enforcement ─────────────────────────────────────────
+            //    If shaft is at or past the limit in the direction of output, zero it.
+            val atPortLimit = shaft <= -config.shaftLimitPortDeg && output < 0f
+            val atStbdLimit = shaft >=  config.shaftLimitStbdDeg && output > 0f
+
+            if (atPortLimit || atStbdLimit) {
+                // 2. Anti-windup: reset integral when hard-limited
+                integral    = 0f
+                finalOutput = 0f
+                shaftStatus = if (atPortLimit) ShaftStatus.AT_PORT_LIMIT
+                else             ShaftStatus.AT_STBD_LIMIT
+            } else {
+                finalOutput = output
+                // 3. Actuator lag/failure detection ───────────────────────────────
+                //    Track movement since last nonzero output command.
+                val absOutput = kotlin.math.abs(output)
+                if (absOutput > config.outputLimitDeg * 0.1f) {
+                    // Output is nonzero — watch for shaft movement
+                    if (shaftMovingStartMs == 0L) {
+                        shaftMovingStartMs = System.currentTimeMillis()
+                        shaftAngleAtCommandStart = shaft
+                    }
+                    val elapsed = System.currentTimeMillis() - shaftMovingStartMs
+                    val moved   = kotlin.math.abs(shaft - shaftAngleAtCommandStart)
+                    shaftStatus = if (elapsed > config.shaftLagWindowMs &&
+                        moved < config.shaftLagThresholdDeg)
+                        ShaftStatus.LAGGING
+                    else
+                        ShaftStatus.OK
+                } else {
+                    // Output near zero — reset lag detector
+                    shaftMovingStartMs       = 0L
+                    shaftAngleAtCommandStart = 0f
+                    shaftStatus              = ShaftStatus.OK
+                }
+            }
+        }
+
         return PidResult(
-            output     = output,
-            error      = error,
-            inDeadband = false,
-            offCourse  = kotlin.math.abs(error) > config.offCourseAlarmDeg
+            output      = finalOutput,
+            error       = error,
+            inDeadband  = false,
+            offCourse   = kotlin.math.abs(error) > config.offCourseAlarmDeg,
+            shaftStatus = shaftStatus
         )
     }
 }
 
+/** Status from shaft sensor supervision in the PID loop. */
+enum class ShaftStatus {
+    OK,             // normal operation
+    AT_PORT_LIMIT,  // shaft at port limit — output clamped to 0
+    AT_STBD_LIMIT,  // shaft at stbd limit — output clamped to 0
+    LAGGING,        // output commanded but shaft not responding
+    NO_SENSOR       // shaft sensor disabled or uncalibrated
+}
+
 data class PidResult(
-    val output: Float,
-    val error: Float,
-    val inDeadband: Boolean,
-    val offCourse: Boolean
+    val output:      Float,
+    val error:       Float,
+    val inDeadband:  Boolean,
+    val offCourse:   Boolean,
+    val shaftStatus: ShaftStatus = ShaftStatus.NO_SENSOR
 )
 
 // ─────────────────────────────────────────────

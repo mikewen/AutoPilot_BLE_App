@@ -45,6 +45,7 @@ fun DashboardScreen(
     val imuState    by vm.imuState.collectAsState()
     val gpsData     by vm.gpsData.collectAsState()
     val targetWp    by vm.targetWaypoint.collectAsState()
+    val shadowPid   by vm.shadowPid.collectAsState()
 
     Column(Modifier.fillMaxSize().background(NavyDeep)) {
         TopBar(connection, imuConn, profile, onSettings, onMapTarget, onDisconnect)
@@ -71,10 +72,11 @@ fun DashboardScreen(
 
             // Engage / Standby — shows data panel when engaged
             EngagePanel(
-                state     = state,
-                gpsData   = gpsData,
-                onEngage  = vm::engage,
-                onStandby = vm::standby
+                state      = state,
+                gpsData    = gpsData,
+                shaftStatus = shadowPid.shaftStatus,
+                onEngage   = vm::engage,
+                onStandby  = vm::standby
             )
 
             // Manual throttle panel — only for DIFF_THRUST (dual motor) when NOT engaged
@@ -425,10 +427,11 @@ private fun DeadbandStatusRow(state: AutopilotState, deadbandDeg: Float) {
 
 @Composable
 private fun EngagePanel(
-    state: AutopilotState,
-    gpsData: GpsManager.GpsData,
-    onEngage: () -> Unit,
-    onStandby: () -> Unit
+    state:       AutopilotState,
+    gpsData:     GpsManager.GpsData,
+    shaftStatus: com.mikewen.autopilot.model.ShaftStatus,
+    onEngage:    () -> Unit,
+    onStandby:   () -> Unit
 ) {
     if (state.engaged) {
         // ── Engaged: show data + standby button ──────────────────────────────
@@ -488,6 +491,25 @@ private fun EngagePanel(
                             String.format("%+.0f%%",
                                 (state.starboardThrottle - state.portThrottle) * 100f),
                             AmberWarn)
+                    }
+                }
+                // Shaft sensor status row
+                if (shaftStatus != com.mikewen.autopilot.model.ShaftStatus.NO_SENSOR) {
+                    val (statusColor, statusText) = when (shaftStatus) {
+                        com.mikewen.autopilot.model.ShaftStatus.OK ->
+                            Pair(GreenGo, "SHAFT OK")
+                        com.mikewen.autopilot.model.ShaftStatus.AT_PORT_LIMIT ->
+                            Pair(AmberWarn, "⚠ PORT LIMIT")
+                        com.mikewen.autopilot.model.ShaftStatus.AT_STBD_LIMIT ->
+                            Pair(AmberWarn, "⚠ STBD LIMIT")
+                        com.mikewen.autopilot.model.ShaftStatus.LAGGING ->
+                            Pair(RedAlarm, "⚠ ACTUATOR LAG")
+                        else -> Pair(Muted, "")
+                    }
+                    if (statusText.isNotEmpty()) {
+                        Text(statusText,
+                            style = MaterialTheme.typography.labelMedium,
+                            color = statusColor)
                     }
                 }
                 if (state.inDeadband) {
@@ -1031,6 +1053,8 @@ private fun AlarmBanner(state: AutopilotState) {
             Column {
                 if (state.offCourseAlarm) Text("⚠ OFF COURSE ALARM",
                     style = MaterialTheme.typography.labelLarge, color = RedAlarm)
+                // Shaft lag alarm — shown when AlarmBanner is visible
+                // Note: AlarmBanner is only shown when offCourseAlarm — extend if needed
             }
         }
     }

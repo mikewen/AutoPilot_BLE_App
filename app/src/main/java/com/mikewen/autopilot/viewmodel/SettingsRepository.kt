@@ -63,7 +63,12 @@ class SettingsRepository(private val context: Context) {
             maxScaleSpeedKt    = prefs[key(p, "max_scale_speed")] ?: d.maxScaleSpeedKt,
             minSpeedScale      = prefs[key(p, "min_speed_scale")] ?: d.minSpeedScale,
             steerScaleMs       = prefs[keyInt(p,  "steer_scale_ms")]   ?: d.steerScaleMs,
-            useKalmanFilter    = prefs[keyBool(p, "use_kalman")]        ?: d.useKalmanFilter
+            useKalmanFilter    = prefs[keyBool(p, "use_kalman")]        ?: d.useKalmanFilter,
+            useSteerSensor     = prefs[keyBool(p, "use_steer_sensor")] ?: d.useSteerSensor,
+            shaftLimitPortDeg  = prefs[key(p, "shaft_limit_port")]    ?: d.shaftLimitPortDeg,
+            shaftLimitStbdDeg  = prefs[key(p, "shaft_limit_stbd")]    ?: d.shaftLimitStbdDeg,
+            shaftLagThresholdDeg = prefs[key(p, "shaft_lag_thresh")] ?: d.shaftLagThresholdDeg,
+            shaftLagWindowMs   = prefs[key(p, "shaft_lag_window")]?.toLong() ?: d.shaftLagWindowMs
         )
     }
 
@@ -81,6 +86,11 @@ class SettingsRepository(private val context: Context) {
             prefs[key(profile,  "min_speed_scale")] = config.minSpeedScale
             prefs[keyInt(profile,  "steer_scale_ms")]  = config.steerScaleMs
             prefs[keyBool(profile, "use_kalman")]       = config.useKalmanFilter
+            prefs[keyBool(profile, "use_steer_sensor")] = config.useSteerSensor
+            prefs[key(profile, "shaft_limit_port")]    = config.shaftLimitPortDeg
+            prefs[key(profile, "shaft_limit_stbd")]    = config.shaftLimitStbdDeg
+            prefs[key(profile, "shaft_lag_thresh")]    = config.shaftLagThresholdDeg
+            prefs[key(profile, "shaft_lag_window")]    = config.shaftLagWindowMs.toFloat()
         }
     }
 }

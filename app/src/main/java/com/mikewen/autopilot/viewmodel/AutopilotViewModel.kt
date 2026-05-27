@@ -117,6 +117,12 @@ class AutopilotViewModel(application: Application) : AndroidViewModel(applicatio
         gpsManager.fusion.useKalman = v
     }
 
+    fun updateUseSteerSensor(v: Boolean)       { updateAndSave(_pidConfig.value.copy(useSteerSensor = v)) }
+    fun updateShaftLimitPort(v: Float)          { updateAndSave(_pidConfig.value.copy(shaftLimitPortDeg = v)) }
+    fun updateShaftLimitStbd(v: Float)          { updateAndSave(_pidConfig.value.copy(shaftLimitStbdDeg = v)) }
+    fun updateShaftLagThreshold(v: Float)       { updateAndSave(_pidConfig.value.copy(shaftLagThresholdDeg = v)) }
+    fun updateShaftLagWindow(v: Float)          { updateAndSave(_pidConfig.value.copy(shaftLagWindowMs = v.toLong())) }
+
     fun applyPid() {
         val config = _pidConfig.value
         bleManager.setPid(config)
@@ -241,7 +247,8 @@ class AutopilotViewModel(application: Application) : AndroidViewModel(applicatio
             currentHeading = autopilotState.value.currentHeading,
             targetHeading  = _targetHeading.value,
             gyroZDegS      = gpsManager.fusion.lastGyroZDegS,
-            speedKnots     = _gpsData.value.speedKnots
+            speedKnots     = _gpsData.value.speedKnots,
+            shaftAngleDeg  = autopilotState.value.shaftAngleDeg
         )
     }
 
