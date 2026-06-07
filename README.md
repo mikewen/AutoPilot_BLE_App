@@ -1,10 +1,10 @@
 # AutoPilot BLE App
 
 Android BLE autopilot controller for boats.  
-Supports tiller autopilots and differential-thrust (dual-motor) autopilots via Bluetooth Low Energy.
+Supports tiller, differential-thrust, and thrust-vector autopilots via Bluetooth Low Energy.
 
 **GitHub:** https://github.com/mikewen/AutoPilot_BLE_App  
-**Version:** 1.1.0 · Min SDK 26 (Android 8.0) · Target SDK 34  
+**Version:** 1.2.0 · Min SDK 26 (Android 8.0) · Target SDK 34  
 **Language:** Kotlin · Jetpack Compose · Material 3
 
 ---
@@ -17,57 +17,148 @@ Supports tiller autopilots and differential-thrust (dual-motor) autopilots via B
 |---|---|---|
 | `BLE_tiller` | Tiller | Linear motor + rudder sensor |
 | `GPS_PWM` | Tiller | Tiller with integrated GPS module |
+| `GPS_Steer` | Thrust Vector | GPS + MMC5603/QMC6308 shaft sensor |
 | `ESC_PWM` | Differential Thrust | Dual ESC / RC-PWM motors |
 | `BLDC_PWM` | Differential Thrust | Dual BLDC direct-duty motors |
+| `THRUST_VECTOR`, `THRUST_VEC*` | Thrust Vector | Vectored nozzle / servo rudder |
 
-Substring matching also works — e.g. `ESC_PWM_v2` is recognised as Differential Thrust.
+Substring matching — e.g. `ESC_PWM_v2` is recognised as Differential Thrust.
 
 ### IMU Sensor (optional, any autopilot type)
 
 | BLE Name | Notes |
 |---|---|
-| `IMU_PWM`, `IMU_*` | External compass/attitude sensor |
+| `IMU_PWM`, `IMU_*` | External compass/attitude sensor (ae00/ae30 hardware protocol) |
 
-The IMU sensor provides heading, pitch, roll, and calibration status. When connected it becomes the primary heading source, overriding the autopilot controller's own heading characteristic.
+### LOOKBON BLE Remote (optional)
+
+| BLE Name | Notes |
+|---|---|
+| `LOOKBON*` | BLE joystick remote — course adjust when engaged, manual steer when standby |
 
 ### BLE Protocol (AC6329C hardware — ae00/ae30 service)
 
 | Characteristic | Direction | Purpose |
 |---|---|---|
-| `ae02` | NOTIFY | A1/A2/A3 packet stream (50 Hz IMU, 1 Hz GNSS, 0.2 Hz position) |
-| `ae03` | WRITE NO RESPONSE | Motor commands + autopilot commands |
-| `ae10` | READ/WRITE | Status string / mode switch |
+| `ae02` | NOTIFY | Sensor packet stream |
+| `ae03` | WRITE NO RESPONSE | Motor + autopilot commands |
 
 **Packet types on ae02:**
 
 | Byte[0] | Name | Rate | Content |
 |---|---|---|---|
-| `0xA1` | IMU+Mag | 50 Hz | ax,ay,az (QMI8658C) · gx,gy,gz · mx,my,mz (MMC5603) |
-| `0xA2` | GNSS Heading | 1 Hz | PQTMTAR dual-antenna heading, accuracy, quality, satellites |
+| `0xA1` | IMU+Mag | 20 Hz | QMI8658C accel/gyro · MMC5603NJ mag |
+| `0xA2` | GNSS Heading | 1 Hz | PQTMTAR dual-antenna heading, accuracy, baseline, quality |
 | `0xA3` | Position | 0.2 Hz | GNRMC lat/lon, speed, course |
+| `0xA5` | Shaft/Rudder | 20 Hz | MMC5603NJ 20-bit (11 bytes) or QMC6308 16-bit (8 bytes) |
 
-**Commands on ae03 (5-byte motor packet):**
+**GPS_Steer steer command (ae03, 5 bytes):**
 
 ```
-[CMD, portLo, portHi, stbdLo, stbdHi]   little-endian 16-bit duties
+byte[0]  's'  0x73   steer command
+byte[1]  side  'L' 0x4C = port | 'R' 0x52 = stbd | 'C' 0x43 = stop
+byte[2]  PWM power (0–255, currently fixed at 100)
+byte[3]  runtimeMs low  byte (uint16 LE)
+byte[4]  runtimeMs high byte
+runtimeMs = steerScaleMs × abs(step)
 ```
 
-| CMD | Value | Mode | Duty range |
-|---|---|---|---|
-| `CMD_ESC_PWM` | `0x01` | RC PWM | 500–1000 (500=1000µs stop, 1000=2000µs full) |
-| `CMD_BLDC_DUTY` | `0x02` | BLDC direct | 0–10000 (0=stop, 10000=100%) |
-| `CMD_STOP` | `0xFF` | Hard stop | Zero duty both channels |
-
-**Autopilot commands on ae03 (1–3 byte):**
+**Autopilot commands on ae03:**
 
 | CMD | Value | Payload |
 |---|---|---|
 | `CMD_ENGAGE` | `0x01` | — |
 | `CMD_STANDBY` | `0x02` | — |
 | `CMD_SET_HDG` | `0x03` | heading (uint16 BE, 0–359°) |
-| `CMD_ADJUST_HDG` | `0x04` | delta (int8, –10…+10°) |
+| `CMD_ADJUST_HDG` | `0x04` | delta (int8, −10…+10°) |
 | `CMD_SET_PID` | `0x05` | Kp, Ki, Kd (uint16 × 100 each) |
 | `CMD_SET_DEADBAND` | `0x07` | tenths of a degree (uint16) |
+
+---
+
+## Boat Profiles
+
+Three independent boat profiles, each with its own full `PidConfig`:
+
+| Profile | Icon | Description |
+|---|---|---|
+| `CL16` | ⛵ | CL 16 — tiller autopilot |
+| `Mac25` | 🚢 | Macgregor 25 — main boat |
+| `Toy` | 🛥 | Test / toy boat |
+
+Select profile on the **TypeSelectScreen** before scanning. All settings (PID gains, steer scale, shaft limits, filter choice) are stored independently per profile. Switching profiles instantly loads that boat's saved config.
+
+---
+
+## PID Architecture
+
+### Cascaded PID + Feed-Forward
+
+```
+Heading error (°)
+      │
+      ▼  Outer loop (Kp × error + Ki × ∫error·dt)
+Desired yaw rate (°/s)
+      │
+      ├──▶ Feed-Forward (ffGain × desiredYawRate) ──────────────────────────┐
+      │                                                                      │
+      ▼  Inner loop                                                          │
+yawRateError = desiredYawRate − gyroZ                                       │
+innerCorrection = kpInner × yawRateError − kdInner × gyroAccel             │
+      │                                                                      │
+      └──────────────────────────────────────────────────────────────────────┤
+                                                                             ▼
+                                                                    Raw output = FF + inner + bias
+                                                                             │
+                                                                      Rate limiter
+                                                                             │
+                                                                      Shaft supervision
+                                                                             │
+                                                                      Final output
+```
+
+**Why it handles wind gusts better:** The feed-forward pre-positions the rudder the moment a heading error starts building — no lag waiting for the integrator. The inner loop then sees the residual yaw rate error and damps it with gyro acceleration feedback. A sudden gust changes `gyroZ` immediately, so `kdInner × gyroAccel` produces an instant corrective bump.
+
+Set `ffGain=0`, `kpInner=0`, `kdInner=0` to fall back to classic single-loop PID.
+
+### PID Loop Rate
+
+The PID runs on the **autopilot MCU at 20 Hz**, driven by A1 packet cadence. The phone is not in the control loop — it configures, monitors, and displays a shadow PID result for tuning. `computeShadowPid()` runs at 1 Hz on the phone for display only.
+
+### PidConfig Fields (all persisted per BoatProfile)
+
+| Field | Default | Description |
+|---|---|---|
+| `kp` | 1.5 | Outer loop proportional |
+| `ki` | 0.05 | Outer loop integral |
+| `kd` | 0.3 | Gyro D-term (single-loop mode) |
+| `ffGain` | 0.3 | Feed-forward gain on desired yaw rate |
+| `kpInner` | 0.5 | Inner loop P on yaw rate error |
+| `kdInner` | 0.05 | Inner loop D on gyro acceleration |
+| `outputLimitDeg` | 30° | Max rudder / thrust differential |
+| `rateLimitDegPerSec` | 60°/s | Max output change per second (0=off) |
+| `deadbandDeg` | 3° | Error below this suppresses output |
+| `steeringBiasDeg` | 0° | Constant offset for hull asymmetry |
+| `offCourseAlarmDeg` | 15° | Off-course alarm threshold |
+| `maxScaleSpeedKt` | 6 kt | Speed at which gain scaling reaches minimum |
+| `minSpeedScale` | 0.4 | Minimum gain multiplier at high speed |
+| `steerScaleMs` | 200 ms | GPS_Steer motor runtime per step unit |
+| `useKalmanFilter` | false | Kalman vs complementary filter in SensorFusion |
+| `useSteerSensor` | false | Enable shaft sensor supervision in PID |
+| `shaftLimitPortDeg` | 40° | Hard port stop |
+| `shaftLimitStbdDeg` | 40° | Hard stbd stop |
+| `shaftLagThresholdDeg` | 2° | Min shaft movement expected in lag window |
+| `shaftLagWindowMs` | 2000 ms | Lag detection window |
+
+### Shaft Sensor Supervision (when `useSteerSensor=true`)
+
+1. **Hard limit enforcement** — output zeroed when shaft hits port/stbd limit; integral reset (anti-windup)
+2. **Anti-windup** — integral clamped when motor is against a mechanical stop
+3. **Lag/failure detection** — if output > 10% of limit for `shaftLagWindowMs` but shaft moved < `shaftLagThresholdDeg` → `ShaftStatus.LAGGING` alarm shown in dashboard
+
+### ShaftStatus enum
+
+`OK | AT_PORT_LIMIT | AT_STBD_LIMIT | LAGGING | NO_SENSOR`
 
 ---
 
@@ -76,116 +167,134 @@ The IMU sensor provides heading, pitch, roll, and calibration status. When conne
 ```
 MainActivity
 └── AutoPilotApp (NavHost)
-    ├── TypeSelectScreen     — choose Tiller or Differential Thrust
-    ├── ScanScreen           — scan + connect autopilot & IMU (2 separate buttons)
+    ├── TypeSelectScreen     — boat profile + autopilot type selection
+    ├── ScanScreen           — scan autopilot, IMU, LOOKBON remote (3 sections)
     ├── DashboardScreen      — main navigation display
-    ├── SettingsScreen       — PID / deadband tuning (persisted via DataStore)
-    ├── CalibrationScreen    — gyro bias + magnetometer hard-iron calibration
-    └── MapTargetScreen      — OSMDroid offline map, tap to set waypoint target
+    ├── SettingsScreen       — full PID tuning (persisted per profile)
+    ├── CalibrationScreen    — gyro/mag/shaft sensor calibration
+    └── MapTargetScreen      — OSMDroid offline map waypoint picker
 ```
 
 ```
 AutopilotViewModel
-├── BleManager          — Android GATT, ae02 notify, ae03 write, GATT write queue
-├── ImuManager          — IMU_* BLE scan, c1–c4 characteristics
-├── GpsManager          — phone GPS + SensorFusion wrapper
-│   └── SensorFusion    — pure-Kotlin heading/position fusion engine
-├── SettingsRepository  — DataStore persistence for PidConfig
+├── BleManager          — Android GATT, ae00/ae30 auto-detect, write queue
+├── ImuManager          — IMU_* BLE scan, ae00/ae30 auto-detect
+├── GpsManager          — phone GPS + SensorFusion + shaft sensor
+│   └── SensorFusion    — pure-Kotlin CF/Kalman, WMM-2020, mag auto-cal
+├── RemoteManager       — LOOKBON BLE remote + VoicePrompt TTS
+├── SettingsRepository  — DataStore, per-profile PidConfig
 └── StateFlows
-    ├── autopilotState  — merged heading: IMU → SensorFusion → BLE
-    ├── gpsData         — position/speed from phone GPS or BLE GNSS
-    ├── imuState        — heading, pitch, roll, temperature, calibrated
-    ├── targetWaypoint  — waypoint set from map
-    └── pidConfig       — Kp/Ki/Kd/deadband/alarm/outputLimit
+    ├── autopilotState  — heading, speed, shaft angle, PID output
+    ├── gpsData         — position, speed, raw mag, shaft angle, GPS COG
+    ├── imuState        — heading, pitch, roll, calibrated
+    ├── activeProfile   — current BoatProfile
+    ├── shadowPid       — phone-side PID result for display (1 Hz)
+    └── pidConfig       — full PidConfig for active profile
 ```
 
-### Heading source priority
+### Heading Source Priority
 
-1. **IMU sensor** (`IMU_*` BLE device) — direct BLE compass heading
-2. **SensorFusion** — complementary/Kalman filter fusing:
-    - A1 magnetometer (tilt-compensated, hard-iron corrected, declination applied)
-    - A1 gyro Z (bias-corrected, scale-applied, flip-corrected)
-    - A2 PQTMTAR dual-antenna GNSS heading (1 Hz)
-    - A3 RMC COG (cached, blended with A2)
-3. **BLE autopilot** own heading characteristic (fallback)
+1. **IMU sensor** (`IMU_*`) — BLE compass, ae00/ae30 protocol, A1 packets
+2. **SensorFusion** — fuses A1 mag + gyro + A2 GNSS heading + A3 COG
+3. **BLE autopilot** heading characteristic (fallback)
 
-Phone GPS contributes **speed and position only** — never heading/COG.
-
-### A1/A2/A3 routing
-
-All connected BLE devices route raw ae02 bytes into the same `GpsManager.feedAe02Bytes()`:
-
-```
-BleManager.incomingData  ──┐
-ImuManager.onRawBytes    ──┼──▶  GpsManager.feedAe02Bytes()
-sensor2.onAe02Raw        ──┘         │
-                                     ▼
-                              parseAcPacket()
-                                ├── A1 → feedGyroBiasSample / feedManualMagSample (if cal active)
-                                │        → SensorFusion.processA1()
-                                ├── A2 → SensorFusion.processA2()
-                                └── A3 → SensorFusion.processA3()
-```
+Phone GPS = position + speed only, never heading.
 
 ---
 
-## Key Features
+## Sensor Fusion
 
-### Dashboard
-- **Compass** — animated dial, current heading (56sp) + target heading, deadband arc
-- **Nav row** — speed · heading error · distance/ETA to target (or GPS source indicator)
-- **Engage panel** — large ENGAGE button when standby; when engaged shows error, PID output, speed, rudder/differential with pulsing STANDBY button
-- **Course adjust** — 4 large buttons: ◀◀ 10° · ◀ 1° · 1° ▶ · 10° ▶▶
-- **Manual Throttle** (Differential Thrust, standby only):
-    - ESC/BLDC mode toggle
-    - SYNC switch — locks both motors to equal speed with single POWER slider
-    - Independent PORT/STBD sliders when SYNC off
-    - ZERO + HARD STOP buttons
-
-### Sensor Fusion (`SensorFusion.kt`)
-- **Complementary filter** (default) or **Kalman filter** (switchable)
-- **WMM-2020 magnetic declination** — auto-computed from GPS position, persisted to SharedPreferences
-- **Gyro bias correction** — subtracted from gz before integration
-- **Mag hard-iron correction** — subtracted before tilt compensation
-- **Sea state estimation** — accel Z + gyro XY variance → 0–1 sea state → auto-deadband
-- **Speed-based mag weight** — mag influence reduced above 5 kt (GPS/gyro dominate)
-- **GPS auto-calibration** — accumulates GPS-vs-mag bias at speed in calm conditions
-- **LC02H misalignment calibration** — auto-corrects sensor mounting offset
-
-### Calibration Screen
-- **Live raw LSB display** (20 Hz from BLE A1 packets):
-    - GX / GY / GZ in large monospace + scale factor + flip flag
-    - AX / AY / AZ + tilt angle
-    - MX / MY / MZ + raw mag heading
-- **Gyro bias calibration** — 5-second sample, keep sensor still
-- **Mag hard-iron calibration** — rotate 360°, progress bar shows accumulated rotation angle (integrated from BLE gyro Z), raw mag heading updates live
-
-### Map Target Picker
-- OSMDroid (OpenStreetMap) — offline-capable after first tile download
-- Tap to place target marker → shows bearing + distance from current position
-- SET AS TARGET → sends bearing to autopilot heading
-- Save up to 10 waypoints per session
-- Centres on current GPS position
-
-### Settings (persisted via DataStore)
-- Kp, Ki, Kd, output limit, deadband, off-course alarm
-- All sliders auto-save on change, restored on next launch
+- **Filters:** Complementary (default) or Kalman — switchable per profile, persisted
+- **WMM-2020 declination** — auto-computed from GPS, persisted
+- **Mag hard-iron correction** — manual cal from CalibrationScreen
+- **Gyro bias** — 5-second still calibration
+- **A2 PQTMTAR gate:** dual-antenna heading accepted only when baseline within tolerance and tilt < 25°
+- **Mag auto-cal:** quality=4 PQTMTAR trusted at any speed; RMC COG blended when speed > 1.5 m/s
 
 ---
 
-## GPS / Position Handling
+## Shaft / Rudder Position Sensor
 
-| Source | Used for | Priority |
+### Sensor Types (auto-detected by A5 packet length)
+
+| Sensor | Packet | Range | Calibration method |
+|---|---|---|---|
+| MMC5603NJ | 11 bytes | 20-bit unsigned, centred at 524288 | 3-point LUT (SET ZERO / PORT / STBD) |
+| QMC6308 | 8 bytes | 16-bit signed LE | Least-squares ellipse fit (sweep cal) |
+
+### QMC6308 Calibration (sweep)
+
+1. Tap **START SWEEP CAL** — drive shaft slowly port → stbd → centre
+2. Progress bar: amber < 36 samples, teal < 72, green ≥ 72 (20 Hz → ~4 s for 72)
+3. Tap **FINISH** — 5×5 least-squares fit computes ellipse centre
+4. Tap **SET PORT** at full port, **SET STBD** at full stbd — sets angle reference
+5. Angle output = `atan2(cy, cx)` from ellipse centre, zeroed to neutral position
+
+### MMC5603 Calibration (LUT)
+
+Drive to each position and tap the button: **SET ZERO** → **SET PORT** → **SET STBD**. All saved to SharedPreferences immediately.
+
+---
+
+## LOOKBON Remote
+
+Connect from the **LOOKBON REMOTE** section in ScanScreen.
+
+| Button | Autopilot engaged | Autopilot standby |
 |---|---|---|
-| BLE A3 (GNRMC) | position, speed | highest when fresh (<5 s) |
-| Phone GPS | position, speed, declination seed | fallback when BLE GPS stale |
-| Neither | — | position unavailable |
+| LEFT_1 | −1° course adjust | Steer motor port 1 step |
+| LEFT_10 | −10° course adjust | Steer motor port 5 steps |
+| RIGHT_1 | +1° course adjust | Steer motor stbd 1 step |
+| RIGHT_10 | +10° course adjust | Steer motor stbd 5 steps |
+| ENGAGE | Engage autopilot | Engage autopilot |
+| DISENGAGE | Standby | Standby |
+| SPEED_STOP | Hard stop motors | Hard stop motors |
 
-Phone GPS `hasFix` threshold: **50 m accuracy** (relaxed so position flows through earlier for declination and map centering).
+Voice announcements: "Engaged", "Standby", "Stop", debounced course/speed, debounced steer direction ("Port" / "Hard port" / "Starboard" / "Hard starboard").
 
-BLE GPS stale timeout: **5 seconds** — if no A2/A3 received, phone GPS resumes automatically.
+---
 
-A1 (IMU) updates **never** change the GPS source — heading and position sources are tracked independently.
+## Dashboard Layout
+
+1. TopBar — device name, RSSI, IMU name, active boat profile icon
+2. ImuStatusChip — shows fused heading, "Data OK" when A1 flowing
+3. CompassCard — dial + CURRENT/TARGET headings + sensor data row (RAW MAG | FUSED | GPS COG)
+4. NavDataRow — SPEED | ERROR | TILT
+5. EngagePanel — ENGAGE button or engaged data (error, PID out, speed, rudder/shaft, ShaftStatus)
+6. ManualSteeringRow — L5 | L1 | ⊙ | R1 | R5 (direct motor/rudder control)
+7. CourseAdjustRow — ◀◀10° | ◀1° | 1°▶ | 10°▶▶
+8. ManualThrottlePanel (Differential Thrust, standby only)
+9. ImuAttitudeCard (when IMU connected)
+10. TillerPanel / DiffThrustPanel (type-specific, shows shaft badge when A5 active)
+11. AlarmBanner
+12. HeadingChart (2-min history, at bottom)
+
+---
+
+## Calibration Screen
+
+Live sensor display at 20 Hz (from BLE A1 + A5 packets):
+
+- **GYRO** — raw GX/GY/GZ LSB, GZ in °/s, net rotation angle (CW+/CCW−, RESET button)
+- **ACCEL** — raw AX/AY/AZ + tilt
+- **MAG** — raw MX/MY/MZ + raw mag heading + hard-iron offsets
+- **SHAFT/RUDDER** — motor control (L5/L1/STOP/R1/R5), live shaft angle, raw X/Y, sensor type, calibration UI
+
+---
+
+## Settings Sections
+
+1. **Deadband & Alarms** — deadband width, off-course alarm
+2. **PID Gains** — Kp, Ki, Kd
+3. **Cascaded PID** — FF gain, Inner Kp, Inner Kd
+4. **Output Limits** — output limit, rate limit
+5. **Steering Correction** — steering bias
+6. **Speed Scaling** — full-scale speed, min gain multiplier + live preview table
+7. **Steer Motor (GPS_Steer)** — steer scale ms + runtime preview
+8. **Steer Sensor Supervision** — enable switch + port/stbd limits, lag threshold/window
+9. **Apply** button — sends Kp/Ki/Kd + deadband to autopilot MCU
+
+All values typed or slid, auto-saved per boat profile. Profile name shown in top bar and banner.
 
 ---
 
@@ -193,45 +302,47 @@ A1 (IMU) updates **never** change the GPS source — heading and position source
 
 | Permission | Purpose |
 |---|---|
-| `BLUETOOTH_SCAN` | BLE device scanning (Android 12+) |
-| `BLUETOOTH_CONNECT` | BLE GATT connection (Android 12+) |
-| `ACCESS_FINE_LOCATION` | Phone GPS + BLE scanning (all versions) |
+| `BLUETOOTH_SCAN` | BLE scanning (Android 12+) |
+| `BLUETOOTH_CONNECT` | BLE GATT (Android 12+) |
+| `ACCESS_FINE_LOCATION` | Phone GPS + BLE scanning |
 | `INTERNET` | OSMDroid tile download |
 | `WRITE_EXTERNAL_STORAGE` | OSMDroid tile cache (Android ≤ 9) |
 
-All runtime permissions are requested together on the Scan screen.
+AndroidManifest also includes `<queries>` block for TTS engine (VoicePrompt requires Android 11+).
 
 ---
 
 ## Project Structure
 
 ```
-app/src/main/
-├── AndroidManifest.xml
-└── java/com/mikewen/autopilot/
-    ├── MainActivity.kt
-    ├── ble/
-    │   ├── BleManager.kt          — Android GATT, ae00/ae30 protocol, GATT write queue
-    │   ├── ImuManager.kt          — IMU_* BLE scan + c1–c4 characteristics
-    │   └── MotorController.kt     — Nordic BLE library wrapper, ae00 motor commands
-    ├── data/
-    │   └── SettingsRepository.kt  — DataStore persistence for PidConfig
-    ├── model/
-    │   └── AutopilotModels.kt     — enums, data classes, BleCommand, BleUuids
-    ├── sensor/
-    │   ├── SensorFusion.kt        — pure Kotlin, no Android imports, WMM-2020
-    │   └── GpsManager.kt          — FusedLocation + ae02 routing + trip logging
-    ├── ui/
-    │   ├── AutoPilotApp.kt        — NavHost, BackHandler on every screen
-    │   └── screens/
-    │       ├── TypeSelectScreen.kt
-    │       ├── ScanScreen.kt       — 2 scan buttons (autopilot + IMU)
-    │       ├── DashboardScreen.kt
-    │       ├── SettingsScreen.kt
-    │       ├── CalibrationScreen.kt
-    │       └── MapTargetScreen.kt
-    └── viewmodel/
-        └── AutopilotViewModel.kt
+app/src/main/java/com/mikewen/autopilot/
+├── ble/
+│   ├── BleManager.kt          ae00/ae30 auto-detect, GATT write queue, steer 5-byte cmd
+│   ├── ImuManager.kt          ae00/ae30 auto-detect for IMU_PWM
+│   ├── LookbonRemote.kt       Nordic BLE, LOOKBON joystick
+│   ├── RemoteCommand.kt       RemoteBleManager constants (GRP_*, CRS_*, SPD_*)
+│   └── RemoteManager.kt       LOOKBON → ViewModel bridge + VoicePrompt
+├── data/
+│   └── SettingsRepository.kt  DataStore, per-profile keys (CL16_kp, MAC25_kp …)
+├── model/
+│   └── AutopilotModels.kt     BoatProfile, AutopilotType, PidConfig, PidController,
+│                              ShaftStatus, PidResult, BleCommand, BleUuids
+├── sensor/
+│   ├── GpsManager.kt          FusedLocation, ae02 routing, A5 shaft sensor,
+│   │                          LUT + LS ellipse cal, computeShaftAngleQmc/Lut
+│   ├── SensorFusion.kt        CF/Kalman, WMM-2020, mag auto-cal, spike rejection
+│   └── VoicePrompt.kt         Debounced TTS wrapper
+├── ui/
+│   ├── AutoPilotApp.kt        NavHost
+│   └── screens/
+│       ├── TypeSelectScreen.kt  boat profile + autopilot type cards
+│       ├── ScanScreen.kt        autopilot + IMU + LOOKBON scan sections
+│       ├── DashboardScreen.kt
+│       ├── SettingsScreen.kt    inline-editable sliders
+│       ├── CalibrationScreen.kt gyro/mag/shaft cal
+│       └── MapTargetScreen.kt
+└── viewmodel/
+    └── AutopilotViewModel.kt
 ```
 
 ---
@@ -247,20 +358,17 @@ androidx.lifecycle:lifecycle-viewmodel-compose:2.7.0
 androidx.datastore:datastore-preferences:1.0.0
 
 // BLE
-no.nordicsemi.android:ble:2.7.4          // MotorController (Nordic BLE library)
+no.nordicsemi.android:ble:2.7.4
 no.nordicsemi.android:ble-ktx:2.7.4
 
 // GPS
 com.google.android.gms:play-services-location:21.2.0
 
 // Map
-org.osmdroid:osmdroid-android:6.1.18    // offline OpenStreetMap
+org.osmdroid:osmdroid-android:6.1.18
 
 // Permissions
 com.google.accompanist:accompanist-permissions:0.34.0
-
-// Serialization (PidConfig DataStore)
-org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.2
 ```
 
 ---
@@ -271,4 +379,4 @@ org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.2
 ./gradlew assembleDebug
 ```
 
-Requires Java 17 · Gradle 8.6 · Android Gradle Plugin 8.x
+Java 17 · Gradle 8.6 · Android Gradle Plugin 8.x

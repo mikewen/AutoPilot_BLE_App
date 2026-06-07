@@ -202,7 +202,29 @@ data class PidConfig(
     // If shaft moves < this amount (°) within lagWindowMs despite nonzero output
     // → declare actuator lag/failure.
     val shaftLagThresholdDeg: Float = 2f,
-    val shaftLagWindowMs:     Long  = 2000L
+    val shaftLagWindowMs:     Long  = 2000L,
+
+    // ── Cascaded PID + Feed-Forward ────────────────────────────────────────
+    //
+    // Architecture:
+    //   Outer loop: heading error (°) → desired yaw rate (°/s)
+    //     output_outer = Kp * error + Ki * ∫error·dt
+    //     (outer Kp/Ki are the existing config.kp / config.ki)
+    //
+    //   Feed-Forward: desired yaw rate → rudder pre-position
+    //     ff = ffGain * desiredYawRate
+    //     Acts immediately — no lag waiting for heading error to build.
+    //
+    //   Inner loop: (desiredYawRate − gyroZ) → rudder correction
+    //     d_inner = kpInner * (desiredYawRate − gyroZ)
+    //     kdInner applied to rate of yaw-rate-error (gyro acceleration)
+    //
+    //   final = ff + d_inner + outer_I + bias
+    //
+    //   Set ffGain=0 and kpInner=0 to fall back to classic single-loop PID.
+    val ffGain:     Float = 0.3f,   // feed-forward gain on desired yaw rate
+    val kpInner:    Float = 0.5f,   // inner loop P on yaw rate error
+    val kdInner:    Float = 0.05f   // inner loop D on yaw rate acceleration
 )
 
 // ─────────────────────────────────────────────
@@ -211,86 +233,112 @@ data class PidConfig(
 
 class PidController(private var config: PidConfig) {
 
-    private var integral: Float = 0f
-    private var lastOutput: Float = 0f
-    private var lastTime:  Long   = System.currentTimeMillis()
-    // Shaft lag detection state
+    // ── Outer loop state ──────────────────────────────────────────────────────
+    private var integral:    Float = 0f
+    private var lastOutput:  Float = 0f
+    private var lastTime:    Long  = System.currentTimeMillis()
+
+    // ── Inner loop state ──────────────────────────────────────────────────────
+    private var lastGyroZ:   Float = 0f   // previous gyroZ for inner D-term
+
+    // ── Shaft supervision state ───────────────────────────────────────────────
     private var shaftMovingStartMs:       Long  = 0L
     private var shaftAngleAtCommandStart: Float = 0f
 
-    fun updateConfig(c: PidConfig) { config = c; integral = 0f; shaftMovingStartMs = 0L }
+    fun updateConfig(c: PidConfig) {
+        config = c; integral = 0f; shaftMovingStartMs = 0L; lastGyroZ = 0f
+    }
 
     fun reset() {
         integral = 0f; lastOutput = 0f; lastTime = System.currentTimeMillis()
-        shaftMovingStartMs = 0L; shaftAngleAtCommandStart = 0f
+        lastGyroZ = 0f; shaftMovingStartMs = 0L; shaftAngleAtCommandStart = 0f
     }
 
     /**
-     * Compute PID output.
+     * Cascaded PID + Feed-Forward compute.
      *
-     * @param currentHeading  Current vessel heading in degrees (0–359)
-     * @param targetHeading   Desired heading in degrees (0–359)
-     * @param gyroZDegS       Yaw rate from BLE IMU gyro in °/s.
-     *                        Used directly as the D-term input — much cleaner than
-     *                        differentiating the heading error, which amplifies GPS noise.
-     *                        A positive value means turning to starboard.
-     *                        Pass 0f if gyro is unavailable.
-     * @param speedKnots      Current vessel speed for gain scaling.
-     *                        Pass 0f to disable speed scaling.
+     * Outer loop  (heading → desired yaw rate):
+     *   desiredYawRate = Kp·error + Ki·∫error·dt
+     *
+     * Feed-Forward (desired yaw rate → rudder pre-position):
+     *   ff = ffGain · desiredYawRate
+     *   Proactively positions the rudder — no lag waiting for error to build.
+     *
+     * Inner loop  (desired yaw rate − actual gyroZ → rudder correction):
+     *   yawRateError = desiredYawRate − gyroZDegS
+     *   inner = kpInner·yawRateError − kdInner·(gyroZ - lastGyroZ)/dt
+     *   Damps oscillation; also rejects wind gusts (gyro sees gust immediately).
+     *
+     * Final output = ff + inner + bias  (clamped, rate-limited)
+     *
+     * Classic single-loop fallback: set ffGain=0, kpInner=0, kdInner=0 —
+     * reduces to output = Kp·error + Ki·∫ − Kd·gyroZ (original behaviour).
      */
     fun compute(
         currentHeading: Float,
         targetHeading:  Float,
         gyroZDegS:      Float  = 0f,
         speedKnots:     Float  = 0f,
-        shaftAngleDeg:  Float? = null   // null = sensor disabled/uncalibrated
+        shaftAngleDeg:  Float? = null
     ): PidResult {
         val now = System.currentTimeMillis()
         val dt  = ((now - lastTime) / 1000f).coerceIn(0.01f, 0.5f)
         lastTime = now
 
-        // ── Heading error (shortest arc, −180…+180) ───────────────────────────
+        // ── Heading error ─────────────────────────────────────────────────────
         var error = targetHeading - currentHeading
         while (error >  180f) error -= 360f
         while (error < -180f) error += 360f
 
         // ── Deadband ──────────────────────────────────────────────────────────
         if (kotlin.math.abs(error) <= config.deadbandDeg) {
-            integral    = 0f
+            integral = 0f; lastGyroZ = gyroZDegS
             return PidResult(
-                output     = 0f,
-                error      = error,
+                output     = 0f, error = error,
                 inDeadband = true,
                 offCourse  = kotlin.math.abs(error) > config.offCourseAlarmDeg
             )
         }
 
-        // ── Speed scaling: reduce P and D aggressiveness at higher speeds ─────
-        // At low speed a boat needs full authority; at planing speed small
-        // corrections are enough and large ones cause uncomfortable yawing.
-        // Scaling does NOT affect Ki — integral keeps correcting steady drift.
+        // ── Speed scaling (P and inner loop, not Ki) ──────────────────────────
         val speedScale: Float = if (config.maxScaleSpeedKt > 0f && speedKnots > 0f) {
-            val t = ((speedKnots - 0f) / config.maxScaleSpeedKt).coerceIn(0f, 1f)
-            1f - t * (1f - config.minSpeedScale)   // 1.0 at 0 kt → minSpeedScale at maxScaleSpeedKt
+            val t = (speedKnots / config.maxScaleSpeedKt).coerceIn(0f, 1f)
+            1f - t * (1f - config.minSpeedScale)
         } else 1f
 
-        // ── P term ────────────────────────────────────────────────────────────
+        // ── Outer loop ────────────────────────────────────────────────────────
+        // Converts heading error to a desired yaw rate setpoint.
         val p = config.kp * speedScale * error
 
-        // ── I term (with anti-windup) ─────────────────────────────────────────
         integral += error * dt
         val maxI  = config.outputLimitDeg / config.ki.coerceAtLeast(0.001f)
         integral  = integral.coerceIn(-maxI, maxI)
         val i     = config.ki * integral
 
-        // ── D term — gyro yaw rate (not shaft sensor) ────────────────────────────
-        val d = -config.kd * speedScale * gyroZDegS
+        // desiredYawRate in °/s — how fast we want the heading to change
+        val desiredYawRate = (p + i).coerceIn(-config.outputLimitDeg, config.outputLimitDeg)
+
+        // ── Feed-Forward ──────────────────────────────────────────────────────
+        // Maps desired yaw rate directly to rudder angle — immediate response.
+        // A positive desiredYawRate (turn stbd) maps to positive rudder (stbd).
+        val ff = config.ffGain * desiredYawRate
+
+        // ── Inner loop ────────────────────────────────────────────────────────
+        // Corrects residual yaw rate error (desired − actual gyroZ).
+        // The inner D-term (kdInner) uses gyro acceleration to damp oscillation
+        // and react to wind gust onset (rapid change in gyroZ).
+        val yawRateError    = desiredYawRate - gyroZDegS
+        val gyroAccel       = (gyroZDegS - lastGyroZ) / dt   // °/s²
+        val innerCorrection = config.kpInner * speedScale * yawRateError -
+                config.kdInner * speedScale * gyroAccel
+        lastGyroZ = gyroZDegS
 
         // ── Steering bias ─────────────────────────────────────────────────────
         val bias = config.steeringBiasDeg
 
-        // ── Raw output ────────────────────────────────────────────────────────
-        val rawOutput = (p + i + d + bias).coerceIn(-config.outputLimitDeg, config.outputLimitDeg)
+        // ── Combine ───────────────────────────────────────────────────────────
+        val rawOutput = (ff + innerCorrection + bias)
+            .coerceIn(-config.outputLimitDeg, config.outputLimitDeg)
 
         // ── Rate limiter ──────────────────────────────────────────────────────
         val output: Float = if (config.rateLimitDegPerSec > 0f) {
@@ -299,7 +347,7 @@ class PidController(private var config: PidConfig) {
         } else rawOutput
         lastOutput = output
 
-        // ── Shaft sensor supervision ─────────────────────────────────────────
+        // ── Shaft sensor supervision ──────────────────────────────────────────
         val shaftStatus: ShaftStatus
         val finalOutput: Float
 
@@ -308,25 +356,17 @@ class PidController(private var config: PidConfig) {
             finalOutput = output
         } else {
             val shaft = shaftAngleDeg
-
-            // 1. Hard limit enforcement ─────────────────────────────────────────
-            //    If shaft is at or past the limit in the direction of output, zero it.
             val atPortLimit = shaft <= -config.shaftLimitPortDeg && output < 0f
             val atStbdLimit = shaft >=  config.shaftLimitStbdDeg && output > 0f
-
             if (atPortLimit || atStbdLimit) {
-                // 2. Anti-windup: reset integral when hard-limited
-                integral    = 0f
+                integral = 0f
                 finalOutput = 0f
                 shaftStatus = if (atPortLimit) ShaftStatus.AT_PORT_LIMIT
                 else             ShaftStatus.AT_STBD_LIMIT
             } else {
                 finalOutput = output
-                // 3. Actuator lag/failure detection ───────────────────────────────
-                //    Track movement since last nonzero output command.
                 val absOutput = kotlin.math.abs(output)
                 if (absOutput > config.outputLimitDeg * 0.1f) {
-                    // Output is nonzero — watch for shaft movement
                     if (shaftMovingStartMs == 0L) {
                         shaftMovingStartMs = System.currentTimeMillis()
                         shaftAngleAtCommandStart = shaft
@@ -335,14 +375,10 @@ class PidController(private var config: PidConfig) {
                     val moved   = kotlin.math.abs(shaft - shaftAngleAtCommandStart)
                     shaftStatus = if (elapsed > config.shaftLagWindowMs &&
                         moved < config.shaftLagThresholdDeg)
-                        ShaftStatus.LAGGING
-                    else
-                        ShaftStatus.OK
+                        ShaftStatus.LAGGING else ShaftStatus.OK
                 } else {
-                    // Output near zero — reset lag detector
-                    shaftMovingStartMs       = 0L
-                    shaftAngleAtCommandStart = 0f
-                    shaftStatus              = ShaftStatus.OK
+                    shaftMovingStartMs = 0L; shaftAngleAtCommandStart = 0f
+                    shaftStatus = ShaftStatus.OK
                 }
             }
         }

@@ -134,6 +134,36 @@ fun SettingsScreen(
                     "Uses live BLE gyro yaw rate — damps oscillation without GPS noise", vm::updatePidKd)
             }
 
+            // ── Feed-Forward + Inner Loop ────────────────────────────────────
+            SectionCard(title = "CASCADED PID  (wind gust rejection)") {
+                Surface(
+                    color  = TealAccent.copy(alpha = 0.08f),
+                    shape  = RoundedCornerShape(10.dp),
+                    border = BorderStroke(1.dp, TealAccent.copy(0.3f))
+                ) {
+                    Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text("How it works", style = MaterialTheme.typography.labelLarge, color = TealAccent)
+                        Text(
+                            "FF: rudder pre-positions instantly on heading error (no lag). " +
+                                    "Inner Kp: corrects residual yaw rate error. " +
+                                    "Inner Kd: damps oscillation using gyro acceleration. " +
+                                    "Set all to 0 to use classic single-loop PID.",
+                            style = MaterialTheme.typography.bodyMedium, color = Muted
+                        )
+                    }
+                }
+                Spacer(Modifier.height(4.dp))
+                ParamSlider("FF gain", pid.ffGain, 0f..2f, "",
+                    "Feed-forward: rudder pre-position proportional to desired yaw rate",
+                    vm::updateFfGain)
+                ParamSlider("Inner Kp", pid.kpInner, 0f..2f, "",
+                    "Inner loop P: corrects yaw rate error (desired − gyroZ)",
+                    vm::updateKpInner)
+                ParamSlider("Inner Kd", pid.kdInner, 0f..0.5f, "",
+                    "Inner loop D: damps gyro acceleration (reacts to gust onset)",
+                    vm::updateKdInner)
+            }
+
             // ── Output Limits ────────────────────────────────────────────────
             SectionCard(title = "OUTPUT LIMITS") {
                 ParamSlider("Output limit", pid.outputLimitDeg, 5f..60f, "°",

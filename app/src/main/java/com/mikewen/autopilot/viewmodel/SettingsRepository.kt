@@ -68,7 +68,10 @@ class SettingsRepository(private val context: Context) {
             shaftLimitPortDeg  = prefs[key(p, "shaft_limit_port")]    ?: d.shaftLimitPortDeg,
             shaftLimitStbdDeg  = prefs[key(p, "shaft_limit_stbd")]    ?: d.shaftLimitStbdDeg,
             shaftLagThresholdDeg = prefs[key(p, "shaft_lag_thresh")] ?: d.shaftLagThresholdDeg,
-            shaftLagWindowMs   = prefs[key(p, "shaft_lag_window")]?.toLong() ?: d.shaftLagWindowMs
+            shaftLagWindowMs   = prefs[key(p, "shaft_lag_window")]?.toLong() ?: d.shaftLagWindowMs,
+            ffGain             = prefs[key(p, "ff_gain")]          ?: d.ffGain,
+            kpInner            = prefs[key(p, "kp_inner")]         ?: d.kpInner,
+            kdInner            = prefs[key(p, "kd_inner")]         ?: d.kdInner
         )
     }
 
@@ -91,6 +94,9 @@ class SettingsRepository(private val context: Context) {
             prefs[key(profile, "shaft_limit_stbd")]    = config.shaftLimitStbdDeg
             prefs[key(profile, "shaft_lag_thresh")]    = config.shaftLagThresholdDeg
             prefs[key(profile, "shaft_lag_window")]    = config.shaftLagWindowMs.toFloat()
+            prefs[key(profile, "ff_gain")]             = config.ffGain
+            prefs[key(profile, "kp_inner")]            = config.kpInner
+            prefs[key(profile, "kd_inner")]            = config.kdInner
         }
     }
 }

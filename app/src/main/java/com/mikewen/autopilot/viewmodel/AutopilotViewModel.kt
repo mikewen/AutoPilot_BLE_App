@@ -122,6 +122,9 @@ class AutopilotViewModel(application: Application) : AndroidViewModel(applicatio
     fun updateShaftLimitStbd(v: Float)          { updateAndSave(_pidConfig.value.copy(shaftLimitStbdDeg = v)) }
     fun updateShaftLagThreshold(v: Float)       { updateAndSave(_pidConfig.value.copy(shaftLagThresholdDeg = v)) }
     fun updateShaftLagWindow(v: Float)          { updateAndSave(_pidConfig.value.copy(shaftLagWindowMs = v.toLong())) }
+    fun updateFfGain(v: Float)                  { updateAndSave(_pidConfig.value.copy(ffGain = v)) }
+    fun updateKpInner(v: Float)                 { updateAndSave(_pidConfig.value.copy(kpInner = v)) }
+    fun updateKdInner(v: Float)                 { updateAndSave(_pidConfig.value.copy(kdInner = v)) }
 
     fun applyPid() {
         val config = _pidConfig.value
@@ -183,15 +186,17 @@ class AutopilotViewModel(application: Application) : AndroidViewModel(applicatio
 
         // ── Wire LookbonRemote → ViewModel actions ────────────────────────────
         remoteManager.apply {
-            onEngage   = ::engage
-            onStandby  = ::standby
-            onPortOne  = ::portOne
-            onPortTen  = ::portTen
-            onStbdOne  = ::stbdOne
-            onStbdTen  = ::stbdTen
-            onHardStop = ::hardStop
-            onEscPwm   = { port, stbd -> sendEscPwm(port, stbd) }
-            onBldcDuty = { port, stbd -> sendBldcDuty(port, stbd) }
+            onEngage     = ::engage
+            onStandby    = ::standby
+            onPortOne    = ::portOne
+            onPortTen    = ::portTen
+            onStbdOne    = ::stbdOne
+            onStbdTen    = ::stbdTen
+            onHardStop   = ::hardStop
+            onEscPwm     = { port, stbd -> sendEscPwm(port, stbd) }
+            onBldcDuty   = { port, stbd -> sendBldcDuty(port, stbd) }
+            // Manual steer when autopilot not engaged
+            onRudderStep = { step -> sendRudderStep(step) }
         }
 
         // ── Route A1/A2/A3 packets from ALL connected BLE devices to SensorFusion ──

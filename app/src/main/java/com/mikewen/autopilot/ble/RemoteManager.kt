@@ -58,6 +58,11 @@ class RemoteManager(private val context: Context) {
     private val _manualOverride = MutableStateFlow(false)
     val manualOverride: StateFlow<Boolean> = _manualOverride.asStateFlow()
 
+    // Accumulated steer steps for debounced voice
+    private var accumulatedSteerSteps = 0
+    private var steerVoiceRunnable: Runnable? = null
+    private val steerHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
     // ── Throttle state (for voice feedback) ──────────────────────────────────
     // Maintained locally so voice can announce current value
     private var currentSpeedPct  = 0    // 0–100
@@ -66,13 +71,18 @@ class RemoteManager(private val context: Context) {
 
     // ── Action callbacks — injected by ViewModel ──────────────────────────────
 
-    var onEngage:     (() -> Unit)? = null
-    var onStandby:    (() -> Unit)? = null
-    var onPortOne:    (() -> Unit)? = null
-    var onPortTen:    (() -> Unit)? = null
-    var onStbdOne:    (() -> Unit)? = null
-    var onStbdTen:    (() -> Unit)? = null
-    var onHardStop:   (() -> Unit)? = null
+    var onEngage:      (() -> Unit)?      = null
+    var onStandby:     (() -> Unit)?      = null
+    var onPortOne:     (() -> Unit)?      = null
+    var onPortTen:     (() -> Unit)?      = null
+    var onStbdOne:     (() -> Unit)?      = null
+    var onStbdTen:     (() -> Unit)?      = null
+    var onHardStop:    (() -> Unit)?      = null
+    /** Called with step: negative=port, positive=stbd, 0=stop — manual steer when not engaged. */
+    var onRudderStep:  ((Int) -> Unit)?   = null
+
+    // Track engaged state so course buttons route correctly
+    private var isEngaged = false
 
     /** Send ESC PWM (port 500–1000, stbd 500–1000) */
     var onEscPwm:     ((Int, Int) -> Unit)? = null
@@ -81,6 +91,7 @@ class RemoteManager(private val context: Context) {
 
     /** Called when autopilot engaged state changes (to keep remote in sync) */
     fun notifyEngaged(engaged: Boolean) {
+        isEngaged = engaged
         remote?.setApEngaged(engaged)
     }
 
@@ -183,11 +194,24 @@ class RemoteManager(private val context: Context) {
                 }
             }
 
-            RemoteBleManager.GRP_COURSE -> when (cmd.action) {
-                RemoteBleManager.CRS_LEFT_1   -> { onPortOne?.invoke() }
-                RemoteBleManager.CRS_LEFT_10  -> { onPortTen?.invoke() }
-                RemoteBleManager.CRS_RIGHT_1  -> { onStbdOne?.invoke() }
-                RemoteBleManager.CRS_RIGHT_10 -> { onStbdTen?.invoke() }
+            RemoteBleManager.GRP_COURSE -> {
+                if (isEngaged) {
+                    // Autopilot engaged: adjust course heading
+                    when (cmd.action) {
+                        RemoteBleManager.CRS_LEFT_1   -> onPortOne?.invoke()
+                        RemoteBleManager.CRS_LEFT_10  -> onPortTen?.invoke()
+                        RemoteBleManager.CRS_RIGHT_1  -> onStbdOne?.invoke()
+                        RemoteBleManager.CRS_RIGHT_10 -> onStbdTen?.invoke()
+                    }
+                } else {
+                    // Standby: drive the steer motor directly
+                    when (cmd.action) {
+                        RemoteBleManager.CRS_LEFT_1   -> { onRudderStep?.invoke(-1); announceSteer(-1) }
+                        RemoteBleManager.CRS_LEFT_10  -> { onRudderStep?.invoke(-5); announceSteer(-5) }
+                        RemoteBleManager.CRS_RIGHT_1  -> { onRudderStep?.invoke(1);  announceSteer(1) }
+                        RemoteBleManager.CRS_RIGHT_10 -> { onRudderStep?.invoke(5);  announceSteer(5) }
+                    }
+                }
             }
 
             RemoteBleManager.GRP_SPEED -> when (cmd.action) {
@@ -254,6 +278,29 @@ class RemoteManager(private val context: Context) {
 
     private fun sendSplitSpeed() {
         onEscPwm?.invoke(pctToEsc(portSpeedPct), pctToEsc(stbdSpeedPct))
+    }
+
+    /**
+     * Debounced voice for manual steer.
+     * Accumulates step presses — speaks the net direction after 400 ms silence.
+     * e.g. 3× LEFT_1 → "Left" after last press, not three separate announcements.
+     */
+    private fun announceSteer(step: Int) {
+        accumulatedSteerSteps += step
+        steerVoiceRunnable?.let { steerHandler.removeCallbacks(it) }
+        val runnable = Runnable {
+            val net = accumulatedSteerSteps
+            accumulatedSteerSteps = 0
+            when {
+                net < -4 -> voice.speak("Hard Left")
+                net < 0  -> voice.speak("Left")
+                net > 4  -> voice.speak("Hard Right")
+                net > 0  -> voice.speak("Right")
+                else     -> voice.speak("Stop")
+            }
+        }
+        steerVoiceRunnable = runnable
+        steerHandler.postDelayed(runnable, 400L)
     }
 
     fun dispose() {
